@@ -1,0 +1,44 @@
+name: broadcaster
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      APP_URL: ${APP_URL:-http://localhost}
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://localhost/livekit}
+      LIVEKIT_INTERNAL_URL: http://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-devsecret-local-only-change-me-123456}
+      TRUST_PROXY: "true"
+    depends_on:
+      - livekit
+  livekit:
+    build:
+      context: deploy
+      dockerfile: LiveKit.Dockerfile
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml", "--node-ip", "${LIVEKIT_NODE_IP:-127.0.0.1}"]
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-devsecret-local-only-change-me-123456}"
+    ports:
+      - "7881:7881/tcp"
+      - "50000-50050:50000-50050/udp"
+  proxy:
+    build:
+      context: deploy
+      dockerfile: Caddy.Dockerfile
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+volumes:
+  caddy_data:
+  caddy_config:
