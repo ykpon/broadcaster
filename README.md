@@ -10,7 +10,7 @@
 docker compose up --build -d
 ```
 
-Откройте **http://localhost**, создайте комнату, выберите источник и отправьте зрителям ссылку из панели «Позовите своих». Первый запуск скачивает образы и собирает клиент и сервер. Готовность: `docker compose ps`; журналы: `docker compose logs -f`. Остановить: `docker compose down`.
+Откройте **http://localhost:8080**, создайте комнату, выберите источник и отправьте зрителям ссылку из панели «Позовите своих». Первый запуск скачивает образы и собирает клиент и сервер. Готовность: `docker compose ps`; журналы: `docker compose logs -f`. Остановить: `docker compose down`.
 
 Локальная конфигурация предназначена для браузеров на том же компьютере. Ссылка localhost не работает на чужом компьютере. Для доступа из интернета настройте домен и публичный IP по инструкции ниже.
 
@@ -31,9 +31,11 @@ docker compose up --build -d
 ## Развёртывание в интернете
 
 1. Направьте DNS A-запись своего домена на IPv4 сервера.
-2. Скопируйте `.env.example` в `.env` и заполните `APP_URL`, `SITE_ADDRESS`, `LIVEKIT_URL`, `LIVEKIT_NODE_IP`, случайный API key и секрет длиной минимум 32 символа. Секрет передаётся только контейнерам Go и LiveKit.
-3. Откройте/пробросьте **80/TCP, 443/TCP, 7881/TCP, 50000–50050/UDP** на Docker-хост. Укажите его публичный IP, а не адрес контейнера, в `LIVEKIT_NODE_IP`. WebSocket идёт через Caddy, медиа — непосредственно в LiveKit по опубликованным портам.
-4. Запустите ту же команду `docker compose up --build -d`. Caddy автоматически получает HTTPS-сертификат. HTTP вне localhost не подходит для захвата экрана.
+2. Скопируйте `.env.example` в `.env` и заполните `APP_URL`, `LIVEKIT_URL`, `LIVEKIT_NODE_IP`, случайный API key и секрет длиной минимум 32 символа. Секрет передаётся только контейнерам Go и LiveKit. Для домена `stream.example.com` значения URL должны быть `https://stream.example.com` и `wss://stream.example.com/livekit`.
+3. Возьмите [пример Nginx-конфигурации](deploy/nginx.conf.example), замените домен и пути сертификата. Директива `map` должна находиться внутри общего блока `http {}`, а `upstream` и `server` — рядом с другими виртуальными хостами. Если сертификаты и HTTP→HTTPS redirect уже настроены, добавьте в существующий HTTPS `server` только два upstream и два location из примера.
+4. Проверьте и примените Nginx: `sudo nginx -t && sudo systemctl reload nginx`.
+5. Откройте/пробросьте **80/TCP, 443/TCP, 7881/TCP, 50000–50050/UDP** на Docker-хост. Порты 8080 и 7880 Compose публикует только на `127.0.0.1`, поэтому они не должны быть открыты в firewall. Укажите публичный IP хоста, а не адрес контейнера, в `LIVEKIT_NODE_IP`. WebSocket идёт через Nginx, медиа — непосредственно в LiveKit по опубликованным портам.
+6. Выполните `docker compose up --build -d --remove-orphans`. Флаг удалит контейнер `proxy` от прежней версии Compose; именованные тома Caddy он не удаляет. HTTP вне localhost не подходит для захвата экрана.
 
 При работе в LAN используйте доступное всем клиентам имя с доверенным HTTPS и IP Docker-хоста. Если внешний домен применяется внутри той же LAN, маршрутизатору может требоваться NAT loopback.
 
@@ -68,6 +70,6 @@ Go 1.26+, Node 24+, pnpm 11.19.0. Production Docker build выполняет Go 
 
 Проверено 17.09.2026: Go tests/vet, четыре теста качества, production build, Docker Compose; в Edge — публикация видео и аудио через настоящий SFU, регулировка громкости/mute, смена настроек качества, приём видео десятью отдельными зрительскими сессиями, отказ одиннадцатому и завершение комнаты. Проверена мобильная вёрстка 390 px и ошибка отсутствующей комнаты. Только источник захвата в автоматическом тесте заменён canvas-видео и генерируемым аудио; проверка реальных игр и стабильных 4K60 остаётся аппаратно-зависимой ручной проверкой.
 
-Структура: `cmd/server` — запуск, `internal/broadcast` — API и LiveKit RoomService, `web/src` — клиент, `deploy` — LiveKit/Caddy. REST API: создание `POST /api/rooms`, состояние `GET /api/rooms/{id}`, токены `POST .../host-token` и `.../viewer-token`, завершение `POST .../end`. Host-запросы принимают `{ "hostSecret": "..." }`; viewer-запросы `{ "session": "..." }`, с пустой строкой при первом входе.
+Структура: `cmd/server` — запуск, `internal/broadcast` — API и LiveKit RoomService, `web/src` — клиент, `deploy` — LiveKit и пример конфигурации Nginx. REST API: создание `POST /api/rooms`, состояние `GET /api/rooms/{id}`, токены `POST .../host-token` и `.../viewer-token`, завершение `POST .../end`. Host-запросы принимают `{ "hostSecret": "..." }`; viewer-запросы `{ "session": "..." }`, с пустой строкой при первом входе.
 
 Ссылки на протоколы: [LiveKit deployment](https://docs.livekit.io/transport/self-hosting/deployment/), [Screen Capture API](https://www.w3.org/TR/screen-capture/).
