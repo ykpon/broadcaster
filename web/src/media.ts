@@ -30,13 +30,18 @@ export async function publishScreen(
   fps: FPS,
 ) {
   const video = stream.getVideoTracks()[0];
-  video.contentHint = "motion";
+  // Screen content is detail-bound, not motion-bound: "motion" lets Chrome trade
+  // resolution away for frame rate and, on tab capture, pushes that demand all the
+  // way down to the capturer, which then delivers a downscaled surface.
+  video.contentHint = "detail";
   const result = await room.localParticipant.publishTrack(video, {
     source: Track.Source.ScreenShare,
     simulcast: false,
     videoCodec: "vp8",
     screenShareEncoding: { maxBitrate: bitrate(res, fps), maxFramerate: fps },
-    degradationPreference: "balanced",
+    // Readable text beats smooth motion for a shared screen; "balanced" permits
+    // sacrificing both resolution and frame rate at once.
+    degradationPreference: "maintain-resolution",
   });
   try {
     const audio = stream.getAudioTracks()[0];
