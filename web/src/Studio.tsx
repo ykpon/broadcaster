@@ -148,7 +148,15 @@ export default function Studio({ id }: { id: string }) {
       // Capture first, while the click still provides user activation.
       stream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
-        audio: true,
+        // Chrome's voice chain (gain control, noise suppression, echo cancel) is built
+        // for a talking head and squashes the dynamics out of game and music audio.
+        // Plain values are "ideal", so a source that ignores them still starts.
+        audio: {
+          channelCount: 2,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
       });
       if (!mounted.current) {
         stream.getTracks().forEach((t) => t.stop());

@@ -45,12 +45,17 @@ export async function publishScreen(
   });
   try {
     const audio = stream.getAudioTracks()[0];
-    if (audio)
+    if (audio) {
+      // Opus stays mono unless stereo is negotiated, and without a hint the encoder is
+      // tuned for speech. Both collapse game and music audio into a flat mix.
+      audio.contentHint = "music";
       await room.localParticipant.publishTrack(audio, {
         source: Track.Source.ScreenShareAudio,
         audioPreset: { maxBitrate: 128_000 },
+        forceStereo: true,
         dtx: false,
       });
+    }
   } catch (error) {
     await room.localParticipant.unpublishTrack(video, false);
     throw error;

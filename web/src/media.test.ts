@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { applyQuality } from "./media";
+import { Track, type Room } from "livekit-client";
+import { applyQuality, publishScreen } from "./media";
 
 // Gecko rejects with a plain Error: Firefox exposes no OverconstrainedError
 // interface at all (MDN BCD api.OverconstrainedError → firefox: false).
@@ -54,5 +55,27 @@ describe("applyQuality", () => {
     await expect(applyQuality(track(stopped), "1080", 30)).rejects.toBe(
       stopped,
     );
+  });
+});
+
+describe("publishScreen", () => {
+  it("публикует звук в стерео и без речевой обработки", async () => {
+    const publishTrack = vi.fn(async (track: MediaStreamTrack) => ({ track }));
+    const room = { localParticipant: { publishTrack } } as unknown as Room;
+    const audio = { kind: "audio" } as MediaStreamTrack;
+    const stream = {
+      getVideoTracks: () => [{ kind: "video" } as MediaStreamTrack],
+      getAudioTracks: () => [audio],
+    } as unknown as MediaStream;
+
+    await publishScreen(room, stream, "1080", 60);
+
+    expect(audio.contentHint).toBe("music");
+    expect(publishTrack).toHaveBeenLastCalledWith(audio, {
+      source: Track.Source.ScreenShareAudio,
+      audioPreset: { maxBitrate: 128_000 },
+      forceStereo: true,
+      dtx: false,
+    });
   });
 });
