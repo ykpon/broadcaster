@@ -6,6 +6,7 @@ import {
   audioHint,
   kbps,
   soundLabel,
+  limitLabel,
   resolutions,
   type Resolution,
 } from "./quality";
@@ -53,11 +54,23 @@ describe("показания звука", () => {
 
   it("называет частоту и каналы захвата", () => {
     expect(soundLabel({ sampleRate: 48000, channelCount: 2 }, 128)).toBe(
-      "48 кГц · стерео · 128 кбит/с",
+      "48 кГц · стерео · 128 кбит/с · потери 0.0%",
     );
-    expect(soundLabel({ sampleRate: 16000, channelCount: 1 }, 24)).toBe(
-      "16 кГц · моно · 24 кбит/с",
+    expect(soundLabel({ sampleRate: 16000, channelCount: 1 }, 24, 0.031)).toBe(
+      "16 кГц · моно · 24 кбит/с · потери 3.1%",
     );
-    expect(soundLabel(undefined, 0)).toBe("— · — · 0 кбит/с");
+    expect(soundLabel(undefined, 0)).toBe("— · — · 0 кбит/с · потери 0.0%");
+  });
+});
+
+describe("limitLabel", () => {
+  it("называет причину, когда энкодер зажат", () => {
+    expect(limitLabel("bandwidth")).toBe(" · упирается в сеть");
+    expect(limitLabel("cpu")).toBe(" · упирается в CPU");
+  });
+
+  it("молчит, когда ограничения нет", () => {
+    expect(limitLabel("none")).toBe("");
+    expect(limitLabel(undefined)).toBe("");
   });
 });

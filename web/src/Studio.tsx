@@ -33,6 +33,7 @@ import {
   audioHint,
   kbps,
   soundLabel,
+  limitLabel,
   type Resolution,
   type FPS,
 } from "./quality";
@@ -107,7 +108,7 @@ export default function Studio({ id }: { id: string }) {
               mounted.current
             )
               setEncoded(
-                `${row.frameWidth || "—"} × ${row.frameHeight || "—"} · ${Math.round(row.framesPerSecond || 0)} FPS`,
+                `${row.frameWidth || "—"} × ${row.frameHeight || "—"} · ${Math.round(row.framesPerSecond || 0)} FPS${limitLabel(row.qualityLimitationReason)}`,
               );
           });
         })
@@ -117,16 +118,18 @@ export default function Studio({ id }: { id: string }) {
         .getTrackPublication(Track.Source.ScreenShareAudio)
         ?.audioTrack?.getRTCStatsReport()
         .then((stats) => {
-          stats?.forEach((row) => {
-            if (row.type !== "outbound-rtp" || !mounted.current) return;
-            setSound(
-              soundLabel(
-                audio,
-                kbps(row.bytesSent, row.timestamp, sent.current),
-              ),
-            );
-            sent.current = { bytes: row.bytesSent, at: row.timestamp };
+          if (!stats || !mounted.current) return;
+          let rate = 0,
+            loss = 0;
+          stats.forEach((row) => {
+            if (row.type === "outbound-rtp") {
+              rate = kbps(row.bytesSent, row.timestamp, sent.current);
+              sent.current = { bytes: row.bytesSent, at: row.timestamp };
+            }
+            // Only the SFU's receiver reports say whether the packets survived the uplink.
+            if (row.type === "remote-inbound-rtp") loss = row.fractionLost || 0;
           });
+          setSound(soundLabel(audio, rate, loss));
         })
         .catch(() => {});
     }, 1000);

@@ -63,6 +63,7 @@ export function kbps(
 export function soundLabel(
   settings: MediaTrackSettings | undefined,
   rate: number,
+  loss = 0,
 ) {
   const hz = settings?.sampleRate ? `${settings.sampleRate / 1000} кГц` : "—",
     channels =
@@ -71,5 +72,17 @@ export function soundLabel(
         : settings?.channelCount
           ? "моно"
           : "—";
-  return `${hz} · ${channels} · ${Math.round(rate)} кбит/с`;
+  return `${hz} · ${channels} · ${Math.round(rate)} кбит/с · потери ${(loss * 100).toFixed(1)}%`;
+}
+// Opus rebuilds lost packets from a band-limited FEC copy, so steady loss is heard as
+// dull audio long before it is heard as dropouts. The encoder reports why it is holding
+// back, which separates a saturated uplink from a CPU that cannot keep up with 4K.
+const limits: Record<string, string> = {
+  bandwidth: "сеть",
+  cpu: "CPU",
+  other: "другое",
+};
+export function limitLabel(reason?: string) {
+  const name = limits[reason ?? ""];
+  return name ? ` · упирается в ${name}` : "";
 }
