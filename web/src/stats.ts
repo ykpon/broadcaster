@@ -1,0 +1,204 @@
+export type CounterSample = {
+  ssrc?: number;
+  timestamp: number;
+  bytes: number;
+};
+
+export type StreamMetrics = {
+  bitrateKbps?: number;
+  codec?: string;
+  packets?: number;
+  packetsLost?: number;
+  lossPercent?: number;
+  retransmittedPackets?: number;
+  rttMs?: number;
+  jitterMs?: number;
+  bufferMs?: number;
+  droppedFrames?: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  limitation?: string;
+};
+
+export type ParsedStats = {
+  metrics: StreamMetrics;
+  sample?: CounterSample;
+};
+
+type StatsRow = Record<string, unknown>;
+
+const numberValue = (row: StatsRow, key: string): number | undefined => {
+  const value = row[key];
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+};
+
+const stringValue = (row: StatsRow, key: string): string | undefined => {
+  const value = row[key];
+  return typeof value === "string" ? value : undefined;
+};
+
+const rowsOf = (rows: Iterable<RTCStats>): StatsRow[] =>
+  Array.from(rows, (row) => row as unknown as StatsRow);
+
+const codecName = (rows: StatsRow[], codecId: string | undefined) => {
+  if (!codecId) return undefined;
+  const codec = rows.find((row) => row.id === codecId && row.type === "codec");
+  const mimeType = codec && stringValue(codec, "mimeType");
+  return mimeType?.replace(/^(?:audio|video)\//, "");
+};
+
+const sampleFor = (
+  row: StatsRow,
+  byteKey: "bytesSent" | "bytesReceived",
+): CounterSample | undefined => {
+  const timestamp = numberValue(row, "timestamp");
+  const bytes = numberValue(row, byteKey);
+  if (timestamp === undefined || bytes === undefined) return undefined;
+
+  const sample: CounterSample = { timestamp, bytes };
+  const ssrc = numberValue(row, "ssrc");
+  if (ssrc !== undefined) sample.ssrc = ssrc;
+  return sample;
+};
+
+const bitrate = (
+  sample: CounterSample | undefined,
+  previous?: CounterSample,
+) => {
+  if (!sample || !previous) return undefined;
+  if (sample.ssrc !== previous.ssrc || sample.timestamp <= previous.timestamp)
+    return undefined;
+  if (sample.bytes < previous.bytes) return undefined;
+  return (
+    ((sample.bytes - previous.bytes) * 8) /
+    (sample.timestamp - previous.timestamp)
+  );
+};
+
+const baseVideoMetrics = (row: StatsRow, rows: StatsRow[]): StreamMetrics => {
+  const metrics: StreamMetrics = {
+    codec: codecName(rows, stringValue(row, "codecId")),
+    width: numberValue(row, "frameWidth"),
+    height: numberValue(row, "frameHeight"),
+    fps: numberValue(row, "framesPerSecond"),
+  };
+  return metrics;
+};
+
+const mediaRow = (rows: StatsRow[], type: "outbound-rtp" | "inbound-rtp") =>
+  rows.find(
+    (candidate) => candidate.type === type && candidate.kind === "video",
+  ) ?? rows.find((candidate) => candidate.type === type);
+
+export function parseOutboundStats(
+  rows: Iterable<RTCStats>,
+  previous?: CounterSample,
+): ParsedStats {
+  const allRows = rowsOf(rows);
+  const row = mediaRow(allRows, "outbound-rtp");
+  if (!row) return { metrics: {} };
+
+  const metrics = baseVideoMetrics(row, allRows);
+  const sample = sampleFor(row, "bytesSent");
+  const rate = bitrate(sample, previous);
+  if (rate !== undefined) metrics.bitrateKbps = rate;
+
+  metrics.packets = numberValue(row, "packetsSent");
+  metrics.retransmittedPackets = numberValue(row, "retransmittedPacketsSent");
+  const limitation = stringValue(row, "qualityLimitationReason");
+  if (limitation !== undefined && limitation !== "none")
+    metrics.limitation = limitation;
+
+  const remoteId = stringValue(row, "remoteId");
+  const remote = allRows.find(
+    (candidate) =>
+      candidate.type === "remote-inbound-rtp" &&
+      ((remoteId !== undefined && candidate.id === remoteId) ||
+        candidate.localId === row.id),
+  );
+  if (remote) {
+    const packetsLost = numberValue(remote, "packetsLost");
+    if (packetsLost !== undefined)
+      metrics.packetsLost = Math.max(0, packetsLost);
+    const fractionLost = numberValue(remote, "fractionLost");
+    if (fractionLost !== undefined) metrics.lossPercent = fractionLost * 100;
+    const roundTripTime = numberValue(remote, "roundTripTime");
+    if (roundTripTime !== undefined) metrics.rttMs = roundTripTime * 1000;
+  }
+
+  return { metrics, sample };
+}
+
+export function parseInboundStats(
+  rows: Iterable<RTCStats>,
+  previous?: CounterSample,
+): ParsedStats {
+  const allRows = rowsOf(rows);
+  const row = mediaRow(allRows, "inbound-rtp");
+  if (!row) return { metrics: {} };
+
+  const metrics = baseVideoMetrics(row, allRows);
+  const sample = sampleFor(row, "bytesReceived");
+  const rate = bitrate(sample, previous);
+  if (rate !== undefined) metrics.bitrateKbps = rate;
+
+  metrics.packets = numberValue(row, "packetsReceived");
+  const packetsLost = numberValue(row, "packetsLost");
+  if (packetsLost !== undefined) metrics.packetsLost = Math.max(0, packetsLost);
+  const framesDropped = numberValue(row, "framesDropped");
+  if (framesDropped !== undefined) metrics.droppedFrames = framesDropped;
+  const jitter = numberValue(row, "jitter");
+  if (jitter !== undefined) metrics.jitterMs = jitter * 1000;
+
+  const jitterBufferDelay = numberValue(row, "jitterBufferDelay");
+  if (jitterBufferDelay !== undefined) {
+    const emittedCount = numberValue(row, "jitterBufferEmittedCount");
+    metrics.bufferMs =
+      emittedCount !== undefined && emittedCount > 0
+        ? (jitterBufferDelay / emittedCount) * 1000
+        : jitterBufferDelay * 1000;
+  }
+
+  return { metrics, sample };
+}
+
+export function streamHealth(
+  metrics: StreamMetrics,
+):
+  | "Ограничено CPU"
+  | "Ограничено сетью"
+  | "Есть потери"
+  | "Стабильно"
+  | "Отлично"
+  | "Определяем" {
+  if (metrics.limitation === "cpu") return "Ограничено CPU";
+  if (metrics.limitation === "bandwidth") return "Ограничено сетью";
+
+  const hasLoss = metrics.lossPercent !== undefined;
+  const hasRtt = metrics.rttMs !== undefined;
+  if (!hasLoss && !hasRtt) return "Определяем";
+  if (metrics.lossPercent !== undefined && metrics.lossPercent >= 3)
+    return "Есть потери";
+  if (
+    (metrics.lossPercent !== undefined && metrics.lossPercent >= 1) ||
+    (metrics.rttMs !== undefined && metrics.rttMs >= 250)
+  )
+    return "Стабильно";
+  if (
+    metrics.lossPercent !== undefined &&
+    metrics.lossPercent < 1 &&
+    metrics.rttMs !== undefined &&
+    metrics.rttMs < 250
+  )
+    return "Отлично";
+  return "Определяем";
+}
+
+export function formatMetric(value: number | undefined, suffix = ""): string {
+  return value === undefined || !Number.isFinite(value)
+    ? "—"
+    : `${Math.round(value)}${suffix}`;
+}
