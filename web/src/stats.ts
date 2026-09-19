@@ -113,18 +113,27 @@ export function parseOutboundStats(
     metrics.limitation = limitation;
 
   const remoteId = stringValue(row, "remoteId");
-  const remote = allRows.find(
-    (candidate) =>
-      candidate.type === "remote-inbound-rtp" &&
-      ((remoteId !== undefined && candidate.id === remoteId) ||
-        candidate.localId === row.id),
-  );
+  const remoteById =
+    remoteId === undefined
+      ? undefined
+      : allRows.find(
+          (candidate) =>
+            candidate.type === "remote-inbound-rtp" &&
+            candidate.id === remoteId,
+        );
+  const remote =
+    remoteById ??
+    allRows.find(
+      (candidate) =>
+        candidate.type === "remote-inbound-rtp" && candidate.localId === row.id,
+    );
   if (remote) {
     const packetsLost = numberValue(remote, "packetsLost");
     if (packetsLost !== undefined)
       metrics.packetsLost = Math.max(0, packetsLost);
     const fractionLost = numberValue(remote, "fractionLost");
-    if (fractionLost !== undefined) metrics.lossPercent = fractionLost * 100;
+    if (fractionLost !== undefined)
+      metrics.lossPercent = Math.max(0, fractionLost * 100);
     const roundTripTime = numberValue(remote, "roundTripTime");
     if (roundTripTime !== undefined) metrics.rttMs = roundTripTime * 1000;
   }
@@ -154,12 +163,13 @@ export function parseInboundStats(
   if (jitter !== undefined) metrics.jitterMs = jitter * 1000;
 
   const jitterBufferDelay = numberValue(row, "jitterBufferDelay");
-  if (jitterBufferDelay !== undefined) {
-    const emittedCount = numberValue(row, "jitterBufferEmittedCount");
-    metrics.bufferMs =
-      emittedCount !== undefined && emittedCount > 0
-        ? (jitterBufferDelay / emittedCount) * 1000
-        : jitterBufferDelay * 1000;
+  const emittedCount = numberValue(row, "jitterBufferEmittedCount");
+  if (
+    jitterBufferDelay !== undefined &&
+    emittedCount !== undefined &&
+    emittedCount > 0
+  ) {
+    metrics.bufferMs = (jitterBufferDelay / emittedCount) * 1000;
   }
 
   return { metrics, sample };

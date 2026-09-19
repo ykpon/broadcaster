@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { parseInboundStats, parseOutboundStats, streamHealth } from "./stats";
+import {
+  formatMetric,
+  parseInboundStats,
+  parseOutboundStats,
+  streamHealth,
+} from "./stats";
 
 describe("outbound WebRTC stats", () => {
   it("считает bitrate, packets, loss, RTT и реальный codec", () => {
@@ -67,6 +72,54 @@ describe("outbound WebRTC stats", () => {
         .metrics.bitrateKbps,
     ).toBeUndefined();
   });
+
+  it("ограничивает отрицательную долю потерь нулём", () => {
+    const rows = [
+      {
+        id: "out",
+        type: "outbound-rtp",
+        kind: "video",
+        ssrc: 7,
+        timestamp: 2000,
+        bytesSent: 100,
+        remoteId: "remote",
+      },
+      {
+        id: "remote",
+        type: "remote-inbound-rtp",
+        localId: "out",
+        fractionLost: -0.01,
+      },
+    ] as unknown as RTCStats[];
+    expect(parseOutboundStats(rows).metrics.lossPercent).toBe(0);
+  });
+
+  it("предпочитает remoteId совпадению localId при выборе remote stats", () => {
+    const rows = [
+      {
+        id: "out",
+        type: "outbound-rtp",
+        kind: "video",
+        ssrc: 7,
+        timestamp: 2000,
+        bytesSent: 100,
+        remoteId: "preferred",
+      },
+      {
+        id: "fallback",
+        type: "remote-inbound-rtp",
+        localId: "out",
+        packetsLost: 40,
+      },
+      {
+        id: "preferred",
+        type: "remote-inbound-rtp",
+        localId: "another-outbound",
+        packetsLost: 4,
+      },
+    ] as unknown as RTCStats[];
+    expect(parseOutboundStats(rows).metrics.packetsLost).toBe(4);
+  });
 });
 
 describe("inbound WebRTC stats", () => {
@@ -107,6 +160,27 @@ describe("inbound WebRTC stats", () => {
       bufferMs: 25,
     });
   });
+
+  it("не сообщает jitter buffer без положительного emitted count", () => {
+    const withoutCount = [
+      {
+        id: "in",
+        type: "inbound-rtp",
+        kind: "video",
+        timestamp: 3000,
+        bytesReceived: 100,
+        jitterBufferDelay: 25,
+      },
+    ] as unknown as RTCStats[];
+    const withZeroCount = [
+      {
+        ...withoutCount[0],
+        jitterBufferEmittedCount: 0,
+      },
+    ] as unknown as RTCStats[];
+    expect(parseInboundStats(withoutCount).metrics.bufferMs).toBeUndefined();
+    expect(parseInboundStats(withZeroCount).metrics.bufferMs).toBeUndefined();
+  });
 });
 
 describe("stream health", () => {
@@ -122,5 +196,13 @@ describe("stream health", () => {
     expect(streamHealth({ lossPercent: 0.2, rttMs: 250 })).toBe("Стабильно");
     expect(streamHealth({ lossPercent: 0.2, rttMs: 40 })).toBe("Отлично");
     expect(streamHealth({})).toBe("Определяем");
+  });
+});
+
+describe("metric formatting", () => {
+  it("отличает недоступное значение от измеренного нуля", () => {
+    expect(formatMetric(undefined, " мс")).toBe("—");
+    expect(formatMetric(0, " мс")).toBe("0 мс");
+    expect(formatMetric(1.6, " мс")).toBe("2 мс");
   });
 });
