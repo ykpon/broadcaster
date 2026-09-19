@@ -49,6 +49,14 @@ test("реальный SFU: публикация тестового видео �
   await expect(page).toHaveURL(/\/studio\//);
   const viewerURL = await page.getByLabel("Ссылка для зрителей").inputValue();
   await page.screenshot({ path: "test-results/studio.png", fullPage: true });
+  await expect(page.getByLabel("Кодек")).toHaveValue("vp8");
+  await page.getByLabel("Кодек").selectOption("vp9");
+  await page.getByLabel("Разрешение").fill("4");
+  await page.getByLabel("Частота кадров").fill("30");
+  await page.getByLabel("Видеобитрейт").fill("20");
+  await page.getByLabel("Аудиобитрейт").fill("192");
+  await page.getByLabel("Баланс качества").fill("65");
+  await page.getByLabel("Кодек").selectOption("vp8");
   const viewerContext = await browser.newContext();
   const viewer = await viewerContext.newPage();
   viewer.on("pageerror", (e) => errors.push(e.message));
@@ -65,6 +73,13 @@ test("реальный SFU: публикация тестового видео �
   await expect(page.getByText("В прямом эфире", { exact: true })).toBeVisible({
     timeout: 30000,
   });
+  await expect(page.getByLabel("Кодек")).toBeDisabled();
+  await expect(
+    page.getByRole("heading", { name: "Диагностика отправки" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Пакеты отправлены", { exact: true }),
+  ).toBeVisible();
   await expect
     .poll(
       () =>
@@ -89,12 +104,6 @@ test("реальный SFU: публикация тестового видео �
       viewer.locator("audio").evaluate((el: HTMLAudioElement) => el.muted),
     )
     .toBe(true);
-  await page.getByLabel("Разрешение").selectOption("2160");
-  await page.getByRole("button", { name: "30 FPS" }).click();
-  await expect(page.getByRole("button", { name: "30 FPS" })).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
   await expect(page.getByRole("alert")).toHaveCount(0);
   await viewer.screenshot({ path: "test-results/viewer.png", fullPage: true });
   const extraContexts = [];

@@ -760,6 +760,77 @@ footer a {
   line-height: 1.5;
   margin-top: 12px;
 }
+.range-control {
+  margin-top: 18px;
+}
+.range-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.panel .range-heading label {
+  margin: 0;
+}
+.range-value {
+  color: var(--accent);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.panel .range-control input[type="range"] {
+  width: 100%;
+  height: 20px;
+  margin-top: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.range-scale {
+  display: flex;
+  justify-content: space-between;
+  color: #727a87;
+  font-size: 9px;
+}
+.diagnostics {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+}
+.diagnostics h2,
+.diagnostics h3 {
+  margin: 0;
+  color: #e2e5eb;
+  font-weight: 600;
+}
+.diagnostics h2 {
+  font-size: 13px;
+}
+.diagnostics h3 {
+  font-size: 10px;
+  color: #959ba7;
+}
+.metric-group {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+}
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 10px;
+  color: #8e98a8;
+  font-size: 10px;
+}
+.metric-row strong {
+  min-width: 0;
+  color: #c5d7b5;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
 .separator {
   height: 1px;
   background: #2b3039;
@@ -1131,6 +1202,9 @@ footer a {
     gap: 15px;
     align-items: start;
   }
+  .diagnostics {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .panel {
     margin-bottom: 0;
   }
@@ -1216,6 +1290,10 @@ footer a {
   }
   .studio-sidebar {
     grid-template-columns: 1fr;
+  }
+  .metric-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
   }
   .scene {
     padding: 30px 18px;

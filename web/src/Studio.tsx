@@ -1,11 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  Room,
-  RoomEvent,
-  ConnectionState,
-  Track,
-  type LocalVideoTrack,
-} from "livekit-client";
+import { Room, RoomEvent, ConnectionState } from "livekit-client";
 import {
   Monitor,
   Check,
@@ -27,24 +21,47 @@ import { Header, ErrorBox, CopyButton, Scene } from "./shared";
 import { useRoomInfo, roomStateLabel } from "./room";
 import { api, message, type Connection } from "./api";
 import {
-  resolutions,
-  bitrate,
+  RESOLUTION_STEPS,
+  SETTING_RANGES,
+  loadStreamSettings,
+  saveStreamSettings,
   captureError,
   audioHint,
-  kbps,
-  soundLabel,
-  limitLabel,
-  type Resolution,
-  type FPS,
+  type StreamSettings,
 } from "./quality";
-import { applyQuality, publishScreen, updateQuality } from "./media";
+import {
+  applyQuality,
+  publishScreen,
+  updateQuality,
+  type PublishedTracks,
+} from "./media";
+import {
+  formatMetric,
+  parseOutboundStats,
+  streamHealth,
+  type CounterSample,
+  type StreamMetrics,
+} from "./stats";
+
+type NumericSetting =
+  "fps" | "videoBitrateMbps" | "audioBitrateKbps" | "balance";
+
+const sameSettings = (left: StreamSettings, right: StreamSettings) =>
+  left.resolution === right.resolution &&
+  left.fps === right.fps &&
+  left.videoBitrateMbps === right.videoBitrateMbps &&
+  left.audioBitrateKbps === right.audioBitrateKbps &&
+  left.balance === right.balance &&
+  left.codec === right.codec;
+
 export default function Studio({ id }: { id: string }) {
   const { info, error: infoError } = useRoomInfo(id);
   const [secret] = useState(
     () => new URLSearchParams(location.hash.slice(1)).get("key") || "",
   );
-  const [res, setRes] = useState<Resolution>("1080"),
-    [fps, setFPS] = useState<FPS>(60),
+  const [settings, setSettings] = useState<StreamSettings>(() =>
+      loadStreamSettings(localStorage),
+    ),
     [busy, setBusy] = useState(false),
     [live, setLive] = useState(false),
     [ended, setEnded] = useState(false),
@@ -54,19 +71,32 @@ export default function Studio({ id }: { id: string }) {
     [hasAudio, setHasAudio] = useState(false),
     [surface, setSurface] = useState(""),
     [state, setState] = useState(ConnectionState.Disconnected),
-    [actual, setActual] = useState(""),
-    [encoded, setEncoded] = useState(""),
-    [sound, setSound] = useState(""),
+    [captureVideo, setCaptureVideo] = useState(""),
+    [captureAudio, setCaptureAudio] = useState(""),
+    [videoMetrics, setVideoMetrics] = useState<StreamMetrics>({}),
+    [audioMetrics, setAudioMetrics] = useState<StreamMetrics>({}),
     [elapsed, setElapsed] = useState(0);
   const roomRef = useRef<Room | null>(null),
     streamRef = useRef<MediaStream | null>(null),
-    trackRef = useRef<LocalVideoTrack | null>(null),
+    confirmedSettings = useRef(settings),
+    tracksRef = useRef<PublishedTracks | null>(null),
     preview = useRef<HTMLVideoElement>(null),
     started = useRef(0),
     ending = useRef(false),
-    sent = useRef({ bytes: 0, at: 0 }),
+    previousVideoSample = useRef<CounterSample | undefined>(undefined),
+    previousAudioSample = useRef<CounterSample | undefined>(undefined),
     mounted = useRef(true);
   const viewerURL = `${location.origin}/watch/${id}`;
+
+  function resetDiagnostics() {
+    previousVideoSample.current = undefined;
+    previousAudioSample.current = undefined;
+    setVideoMetrics({});
+    setAudioMetrics({});
+    setCaptureVideo("");
+    setCaptureAudio("");
+  }
+
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -79,9 +109,14 @@ export default function Studio({ id }: { id: string }) {
     };
   }, []);
   useEffect(() => {
+    saveStreamSettings(localStorage, settings);
+  }, [settings]);
+  useEffect(() => {
     if (info?.state === "ended") {
       setEnded(true);
       setLive(false);
+      tracksRef.current = null;
+      resetDiagnostics();
       streamRef.current?.getTracks().forEach((t) => {
         t.onended = null;
         t.stop();
@@ -93,45 +128,45 @@ export default function Studio({ id }: { id: string }) {
     if (!live) return;
     const timer = setInterval(() => {
       setElapsed(Math.floor((Date.now() - started.current) / 1000));
-      const settings = streamRef.current?.getVideoTracks()[0]?.getSettings();
-      if (settings)
-        setActual(
-          `${settings.width} × ${settings.height} · ${Math.round(settings.frameRate || 0)} FPS`,
+      const stream = streamRef.current;
+      const videoCapture = stream?.getVideoTracks()[0]?.getSettings();
+      if (videoCapture)
+        setCaptureVideo(
+          `${videoCapture.width ?? "—"} × ${videoCapture.height ?? "—"} · ${Math.round(videoCapture.frameRate || 0)} FPS`,
         );
-      void trackRef.current
-        ?.getRTCStatsReport()
-        .then((stats) => {
-          stats?.forEach((row) => {
-            if (
-              row.type === "outbound-rtp" &&
-              row.kind === "video" &&
-              mounted.current
-            )
-              setEncoded(
-                `${row.frameWidth || "—"} × ${row.frameHeight || "—"} · ${Math.round(row.framesPerSecond || 0)} FPS${limitLabel(row.qualityLimitationReason)}`,
-              );
-          });
+      const audioCapture = stream?.getAudioTracks()[0]?.getSettings();
+      if (audioCapture)
+        setCaptureAudio(
+          `${audioCapture.sampleRate ? `${audioCapture.sampleRate / 1000} кГц` : "—"} · ${audioCapture.channelCount === 2 ? "стерео" : audioCapture.channelCount ? "моно" : "—"}`,
+        );
+
+      const tracks = tracksRef.current;
+      if (!tracks) return;
+      void tracks.video
+        .getRTCStatsReport()
+        .then((report) => {
+          if (!report || !mounted.current) return;
+          const parsed = parseOutboundStats(
+            Array.from(report.values()),
+            previousVideoSample.current,
+          );
+          previousVideoSample.current = parsed.sample;
+          setVideoMetrics(parsed.metrics);
         })
         .catch(() => {});
-      const audio = streamRef.current?.getAudioTracks()[0]?.getSettings();
-      void roomRef.current?.localParticipant
-        .getTrackPublication(Track.Source.ScreenShareAudio)
-        ?.audioTrack?.getRTCStatsReport()
-        .then((stats) => {
-          if (!stats || !mounted.current) return;
-          let rate = 0,
-            loss = 0;
-          stats.forEach((row) => {
-            if (row.type === "outbound-rtp") {
-              rate = kbps(row.bytesSent, row.timestamp, sent.current);
-              sent.current = { bytes: row.bytesSent, at: row.timestamp };
-            }
-            // Only the SFU's receiver reports say whether the packets survived the uplink.
-            if (row.type === "remote-inbound-rtp") loss = row.fractionLost || 0;
-          });
-          setSound(soundLabel(audio, rate, loss));
-        })
-        .catch(() => {});
+      if (tracks.audio)
+        void tracks.audio
+          .getRTCStatsReport()
+          .then((report) => {
+            if (!report || !mounted.current) return;
+            const parsed = parseOutboundStats(
+              Array.from(report.values()),
+              previousAudioSample.current,
+            );
+            previousAudioSample.current = parsed.sample;
+            setAudioMetrics(parsed.metrics);
+          })
+          .catch(() => {});
     }, 1000);
     return () => clearInterval(timer);
   }, [live]);
@@ -140,6 +175,8 @@ export default function Studio({ id }: { id: string }) {
     ending.current = true;
     setBusy(true);
     setLive(false);
+    tracksRef.current = null;
+    resetDiagnostics();
     streamRef.current?.getTracks().forEach((t) => {
       t.onended = null;
       t.stop();
@@ -159,6 +196,8 @@ export default function Studio({ id }: { id: string }) {
     setError("");
     setNote("");
     setBusy(true);
+    tracksRef.current = null;
+    resetDiagnostics();
     let stream: MediaStream | null = null;
     let room: Room | null = null;
     try {
@@ -187,7 +226,7 @@ export default function Studio({ id }: { id: string }) {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
-      setNote(await applyQuality(stream.getVideoTracks()[0], res, fps));
+      setNote(await applyQuality(stream.getVideoTracks()[0], settings));
       streamRef.current = stream;
       const auth = await api<Connection>(`/rooms/${id}/host-token`, {
         hostSecret: secret,
@@ -202,6 +241,8 @@ export default function Studio({ id }: { id: string }) {
             t.stop();
           });
           setLive(false);
+          tracksRef.current = null;
+          resetDiagnostics();
           setError(
             "Соединение прервано. Повторите запуск; убедитесь, что студия не открыта в другой вкладке.",
           );
@@ -213,7 +254,8 @@ export default function Studio({ id }: { id: string }) {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
-      trackRef.current = await publishScreen(room, stream, res, fps);
+      tracksRef.current = await publishScreen(room, stream, settings);
+      confirmedSettings.current = settings;
       setHasAudio(stream.getAudioTracks().length > 0);
       setSurface(stream.getVideoTracks()[0].getSettings().displaySurface || "");
       setMuted(false);
@@ -228,6 +270,8 @@ export default function Studio({ id }: { id: string }) {
         void preview.current.play().catch(() => {});
       }
     } catch (e) {
+      tracksRef.current = null;
+      resetDiagnostics();
       stream?.getTracks().forEach((t) => t.stop());
       await room?.disconnect();
       setError(captureError(e));
@@ -235,27 +279,49 @@ export default function Studio({ id }: { id: string }) {
       setBusy(false);
     }
   }
-  async function quality(nextRes: Resolution, nextFPS: FPS) {
-    const oldRes = res,
-      oldFPS = fps;
-    setRes(nextRes);
-    setFPS(nextFPS);
-    if (!trackRef.current || !live) return;
+  async function commitSettings(next: StreamSettings) {
+    setSettings(next);
+    const tracks = tracksRef.current;
+    if (!tracks || !live) {
+      confirmedSettings.current = next;
+      return;
+    }
+    if (sameSettings(next, confirmedSettings.current)) return;
     setBusy(true);
     setError("");
     try {
-      setNote(await updateQuality(trackRef.current, nextRes, nextFPS));
+      setNote(await updateQuality(tracks, next));
+      confirmedSettings.current = next;
     } catch (e) {
-      setRes(oldRes);
-      setFPS(oldFPS);
+      const confirmed = confirmedSettings.current;
       try {
-        await updateQuality(trackRef.current, oldRes, oldFPS);
+        await updateQuality(tracks, confirmed);
       } catch {}
+      setSettings(confirmed);
       setError(`Не удалось изменить качество: ${message(e)}`);
     } finally {
       setBusy(false);
     }
   }
+
+  const draftNumber = (key: NumericSetting, value: string) => ({
+    ...settings,
+    [key]: Number(value),
+  });
+  const commitNumber = (key: NumericSetting, value: string) =>
+    commitSettings(draftNumber(key, value));
+  const draftResolution = (value: string): StreamSettings => ({
+    ...settings,
+    resolution: RESOLUTION_STEPS[Number(value)]?.value ?? settings.resolution,
+  });
+  const resolutionIndex = Math.max(
+    0,
+    RESOLUTION_STEPS.findIndex((item) => item.value === settings.resolution),
+  );
+  const encodedVideo =
+    videoMetrics.width !== undefined || videoMetrics.height !== undefined
+      ? `${formatMetric(videoMetrics.width)} × ${formatMetric(videoMetrics.height)} · ${formatMetric(videoMetrics.fps, " FPS")}`
+      : "—";
   const isEnded = ended || info?.state === "ended";
   return (
     <div className="app">
@@ -379,55 +445,211 @@ export default function Studio({ id }: { id: string }) {
                 <Settings2 size={18} />
                 <h2>Настройки эфира</h2>
               </div>
-              <label htmlFor="resolution">Разрешение</label>
+              <div className="range-control">
+                <div className="range-heading">
+                  <label htmlFor="resolution">Разрешение</label>
+                  <span className="range-value">
+                    {RESOLUTION_STEPS[resolutionIndex].label}
+                  </span>
+                </div>
+                <input
+                  id="resolution"
+                  type="range"
+                  min="0"
+                  max={RESOLUTION_STEPS.length - 1}
+                  step="1"
+                  value={resolutionIndex}
+                  disabled={(busy && !live) || isEnded}
+                  onChange={(event) =>
+                    setSettings(draftResolution(event.currentTarget.value))
+                  }
+                  onPointerUp={(event) =>
+                    void commitSettings(
+                      draftResolution(event.currentTarget.value),
+                    )
+                  }
+                  onKeyUp={(event) =>
+                    void commitSettings(
+                      draftResolution(event.currentTarget.value),
+                    )
+                  }
+                  onBlur={(event) =>
+                    void commitSettings(
+                      draftResolution(event.currentTarget.value),
+                    )
+                  }
+                />
+                <div className="range-scale">
+                  <span>Исходное</span>
+                  <span>4K</span>
+                </div>
+              </div>
+              <div className="range-control">
+                <div className="range-heading">
+                  <label htmlFor="fps">Частота кадров</label>
+                  <span className="range-value">{settings.fps} FPS</span>
+                </div>
+                <input
+                  id="fps"
+                  type="range"
+                  {...SETTING_RANGES.fps}
+                  value={settings.fps}
+                  disabled={(busy && !live) || isEnded}
+                  onChange={(event) =>
+                    setSettings(draftNumber("fps", event.currentTarget.value))
+                  }
+                  onPointerUp={(event) =>
+                    void commitNumber("fps", event.currentTarget.value)
+                  }
+                  onKeyUp={(event) =>
+                    void commitNumber("fps", event.currentTarget.value)
+                  }
+                  onBlur={(event) =>
+                    void commitNumber("fps", event.currentTarget.value)
+                  }
+                />
+                <div className="range-scale">
+                  <span>15</span>
+                  <span>120 FPS</span>
+                </div>
+              </div>
+              <div className="range-control">
+                <div className="range-heading">
+                  <label htmlFor="video-bitrate">Видеобитрейт</label>
+                  <span className="range-value">
+                    {settings.videoBitrateMbps} Мбит/с
+                  </span>
+                </div>
+                <input
+                  id="video-bitrate"
+                  type="range"
+                  {...SETTING_RANGES.videoBitrateMbps}
+                  value={settings.videoBitrateMbps}
+                  disabled={(busy && !live) || isEnded}
+                  onChange={(event) =>
+                    setSettings(
+                      draftNumber(
+                        "videoBitrateMbps",
+                        event.currentTarget.value,
+                      ),
+                    )
+                  }
+                  onPointerUp={(event) =>
+                    void commitNumber(
+                      "videoBitrateMbps",
+                      event.currentTarget.value,
+                    )
+                  }
+                  onKeyUp={(event) =>
+                    void commitNumber(
+                      "videoBitrateMbps",
+                      event.currentTarget.value,
+                    )
+                  }
+                  onBlur={(event) =>
+                    void commitNumber(
+                      "videoBitrateMbps",
+                      event.currentTarget.value,
+                    )
+                  }
+                />
+                <div className="range-scale">
+                  <span>1</span>
+                  <span>80 Мбит/с</span>
+                </div>
+              </div>
+              <div className="range-control">
+                <div className="range-heading">
+                  <label htmlFor="audio-bitrate">Аудиобитрейт</label>
+                  <span className="range-value">
+                    {settings.audioBitrateKbps} кбит/с
+                  </span>
+                </div>
+                <input
+                  id="audio-bitrate"
+                  type="range"
+                  {...SETTING_RANGES.audioBitrateKbps}
+                  value={settings.audioBitrateKbps}
+                  disabled={(busy && !live) || isEnded}
+                  onChange={(event) =>
+                    setSettings(
+                      draftNumber(
+                        "audioBitrateKbps",
+                        event.currentTarget.value,
+                      ),
+                    )
+                  }
+                  onPointerUp={(event) =>
+                    void commitNumber(
+                      "audioBitrateKbps",
+                      event.currentTarget.value,
+                    )
+                  }
+                  onKeyUp={(event) =>
+                    void commitNumber(
+                      "audioBitrateKbps",
+                      event.currentTarget.value,
+                    )
+                  }
+                  onBlur={(event) =>
+                    void commitNumber(
+                      "audioBitrateKbps",
+                      event.currentTarget.value,
+                    )
+                  }
+                />
+                <div className="range-scale">
+                  <span>32</span>
+                  <span>320 кбит/с</span>
+                </div>
+              </div>
+              <div className="range-control">
+                <div className="range-heading">
+                  <label htmlFor="balance">Баланс качества</label>
+                  <span className="range-value">{settings.balance}%</span>
+                </div>
+                <input
+                  id="balance"
+                  type="range"
+                  {...SETTING_RANGES.balance}
+                  value={settings.balance}
+                  disabled={(busy && !live) || isEnded}
+                  onChange={(event) =>
+                    setSettings(
+                      draftNumber("balance", event.currentTarget.value),
+                    )
+                  }
+                  onPointerUp={(event) =>
+                    void commitNumber("balance", event.currentTarget.value)
+                  }
+                  onKeyUp={(event) =>
+                    void commitNumber("balance", event.currentTarget.value)
+                  }
+                  onBlur={(event) =>
+                    void commitNumber("balance", event.currentTarget.value)
+                  }
+                />
+                <div className="range-scale">
+                  <span>Чёткость</span>
+                  <span>Движение</span>
+                </div>
+              </div>
+              <label htmlFor="codec">Кодек</label>
               <select
-                id="resolution"
-                value={res}
-                disabled={busy || isEnded}
-                onChange={(e) =>
-                  void quality(e.target.value as Resolution, fps)
+                id="codec"
+                value={settings.codec}
+                disabled={busy || live || isEnded}
+                onChange={(event) =>
+                  void commitSettings({
+                    ...settings,
+                    codec: event.currentTarget.value as StreamSettings["codec"],
+                  })
                 }
               >
-                {Object.entries(resolutions).map(([key, item]) => (
-                  <option value={key} key={key}>
-                    {item.label}
-                  </option>
-                ))}
+                <option value="vp8">VP8</option>
+                <option value="vp9">VP9</option>
+                <option value="av1">AV1</option>
               </select>
-              <label>Частота кадров</label>
-              <div className="segmented">
-                {([30, 60] as const).map((n) => (
-                  <button
-                    aria-pressed={fps === n}
-                    disabled={busy || isEnded}
-                    onClick={() => void quality(res, n)}
-                    className={fps === n ? "selected" : ""}
-                    key={n}
-                  >
-                    {n} <span>FPS</span>
-                    {fps === n && <Check size={14} />}
-                  </button>
-                ))}
-              </div>
-              <div className="quality-note">
-                До {(bitrate(res, fps) / 1_000_000).toFixed(1)} Мбит/с · зависит
-                от источника и сети
-              </div>
-              {live && (
-                <div className="actual">
-                  <span>
-                    Захват <strong>{actual || "Определяем…"}</strong>
-                  </span>
-                  <span>
-                    Отправка <strong>{encoded || "Определяем…"}</strong>
-                  </span>
-                  {hasAudio && (
-                    <span>
-                      Звук <strong>{sound || "Определяем…"}</strong>
-                    </span>
-                  )}
-                </div>
-              )}
               <div className="separator" />
               <div className="audio-row">
                 <div>
@@ -463,6 +685,106 @@ export default function Studio({ id }: { id: string }) {
                 </button>
               </div>
             </section>
+            {live && (
+              <section className="panel diagnostics">
+                <h2>Диагностика отправки</h2>
+                <div className="metric-group">
+                  <h3>Видео</h3>
+                  <span className="metric-row">
+                    Состояние <strong>{streamHealth(videoMetrics)}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Кодек <strong>{videoMetrics.codec ?? "—"}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Битрейт{" "}
+                    <strong>
+                      {formatMetric(videoMetrics.bitrateKbps, " кбит/с")}
+                    </strong>
+                  </span>
+                  <span className="metric-row">
+                    Предел <strong>{settings.videoBitrateMbps} Мбит/с</strong>
+                  </span>
+                  <span className="metric-row">
+                    Захват <strong>{captureVideo || "—"}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Кодирование <strong>{encodedVideo}</strong>
+                  </span>
+                  <span className="metric-row">
+                    <span>Пакеты отправлены</span>
+                    <strong>{formatMetric(videoMetrics.packets)}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Потеряно{" "}
+                    <strong>{formatMetric(videoMetrics.packetsLost)}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Потери{" "}
+                    <strong>
+                      {formatMetric(videoMetrics.lossPercent, "%")}
+                    </strong>
+                  </span>
+                  <span className="metric-row">
+                    Повторно отправлено{" "}
+                    <strong>
+                      {formatMetric(videoMetrics.retransmittedPackets)}
+                    </strong>
+                  </span>
+                  <span className="metric-row">
+                    RTT{" "}
+                    <strong>{formatMetric(videoMetrics.rttMs, " мс")}</strong>
+                  </span>
+                </div>
+                <div className="metric-group">
+                  <h3>Аудио</h3>
+                  <span className="metric-row">
+                    Состояние аудио{" "}
+                    <strong>{streamHealth(audioMetrics)}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Аудиокодек <strong>{audioMetrics.codec ?? "—"}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Аудиобитрейт{" "}
+                    <strong>
+                      {formatMetric(audioMetrics.bitrateKbps, " кбит/с")}
+                    </strong>
+                  </span>
+                  <span className="metric-row">
+                    Предел аудио{" "}
+                    <strong>{settings.audioBitrateKbps} кбит/с</strong>
+                  </span>
+                  <span className="metric-row">
+                    Захват аудио <strong>{captureAudio || "—"}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Пакеты аудио{" "}
+                    <strong>{formatMetric(audioMetrics.packets)}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Потеряно аудио{" "}
+                    <strong>{formatMetric(audioMetrics.packetsLost)}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Потери аудио{" "}
+                    <strong>
+                      {formatMetric(audioMetrics.lossPercent, "%")}
+                    </strong>
+                  </span>
+                  <span className="metric-row">
+                    Повторно отправлено аудио{" "}
+                    <strong>
+                      {formatMetric(audioMetrics.retransmittedPackets)}
+                    </strong>
+                  </span>
+                  <span className="metric-row">
+                    RTT аудио{" "}
+                    <strong>{formatMetric(audioMetrics.rttMs, " мс")}</strong>
+                  </span>
+                </div>
+              </section>
+            )}
             <section className="panel share-panel">
               <div className="panel-title">
                 <Link2 size={18} />
