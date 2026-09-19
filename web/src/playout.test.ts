@@ -47,4 +47,12 @@ describe("viewer playout buffer", () => {
     expect(() => saveBufferPreference(storage, 1)).not.toThrow();
     expect(loadBufferPreference(storage)).toBeNull();
   });
+  it("normalizes invalid direct application values to Auto", () => {
+    for (const value of [0, 4.1, Number.NaN, Number.POSITIVE_INFINITY, 1.11]) {
+      const receiver = { jitterBufferTarget: 123 } as RTCRtpReceiver;
+      const track = { receiver, setPlayoutDelay: vi.fn() } as unknown as RemoteTrack;
+      expect(applyPlayoutBuffer(track, value)).toBe("jitterBufferTarget");
+      expect(receiver.jitterBufferTarget).toBeNull();
+    }
+  });
 });

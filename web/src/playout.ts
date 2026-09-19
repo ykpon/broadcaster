@@ -9,12 +9,16 @@ function isValidBufferPreference(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0.1 && value <= 4 && Math.abs(value * 10 - Math.round(value * 10)) < Number.EPSILON;
 }
 
+function normalizeBufferPreference(value: unknown): BufferPreference {
+  return value === null || !isValidBufferPreference(value) ? null : value;
+}
+
 export function loadBufferPreference(storage: Storage): BufferPreference {
   try {
     const raw = storage.getItem(STORAGE_KEY);
     if (raw === null || raw === "null") return null;
     const value: unknown = JSON.parse(raw);
-    return isValidBufferPreference(value) ? value : null;
+    return normalizeBufferPreference(value);
   } catch {
     return null;
   }
@@ -30,6 +34,7 @@ export function saveBufferPreference(storage: Storage, value: BufferPreference):
 }
 
 export function applyPlayoutBuffer(track: RemoteTrack, seconds: BufferPreference): PlayoutSupport {
+  seconds = normalizeBufferPreference(seconds);
   const receiver = track.receiver;
   if (!receiver) return "unsupported";
 
