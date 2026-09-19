@@ -46,3 +46,30 @@ export function audioHint(surface: string) {
     return "Вкладка молчала при выборе — звук пойдёт, как только в ней заиграет.";
   return "Нет звука: в диалоге выбора включите «Также передать аудио системы». Для всего экрана это работает в Chrome на Windows; на macOS выберите вкладку браузера.";
 }
+
+// Stats timestamps are milliseconds, so bits over milliseconds is already kbit/s.
+export function kbps(
+  bytes: number,
+  at: number,
+  prev: { bytes: number; at: number },
+) {
+  return prev.at && at > prev.at
+    ? ((bytes - prev.bytes) * 8) / (at - prev.at)
+    : 0;
+}
+// The host cannot hear what viewers hear, so name the two things that decide it:
+// a speech-processed capture arrives at 16 kHz mono, and a squeezed uplink shows
+// up as a bitrate far below the 128 kbit/s we ask Opus for.
+export function soundLabel(
+  settings: MediaTrackSettings | undefined,
+  rate: number,
+) {
+  const hz = settings?.sampleRate ? `${settings.sampleRate / 1000} кГц` : "—",
+    channels =
+      settings?.channelCount === 2
+        ? "стерео"
+        : settings?.channelCount
+          ? "моно"
+          : "—";
+  return `${hz} · ${channels} · ${Math.round(rate)} кбит/с`;
+}
