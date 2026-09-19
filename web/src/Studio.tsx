@@ -3,6 +3,7 @@ import {
   Room,
   RoomEvent,
   ConnectionState,
+  Track,
   type LocalVideoTrack,
 } from "livekit-client";
 import {
@@ -30,6 +31,8 @@ import {
   bitrate,
   captureError,
   audioHint,
+  kbps,
+  soundLabel,
   type Resolution,
   type FPS,
 } from "./quality";
@@ -52,6 +55,7 @@ export default function Studio({ id }: { id: string }) {
     [state, setState] = useState(ConnectionState.Disconnected),
     [actual, setActual] = useState(""),
     [encoded, setEncoded] = useState(""),
+    [sound, setSound] = useState(""),
     [elapsed, setElapsed] = useState(0);
   const roomRef = useRef<Room | null>(null),
     streamRef = useRef<MediaStream | null>(null),
@@ -59,6 +63,7 @@ export default function Studio({ id }: { id: string }) {
     preview = useRef<HTMLVideoElement>(null),
     started = useRef(0),
     ending = useRef(false),
+    sent = useRef({ bytes: 0, at: 0 }),
     mounted = useRef(true);
   const viewerURL = `${location.origin}/watch/${id}`;
   useEffect(() => {
@@ -104,6 +109,23 @@ export default function Studio({ id }: { id: string }) {
               setEncoded(
                 `${row.frameWidth || "—"} × ${row.frameHeight || "—"} · ${Math.round(row.framesPerSecond || 0)} FPS`,
               );
+          });
+        })
+        .catch(() => {});
+      const audio = streamRef.current?.getAudioTracks()[0]?.getSettings();
+      void roomRef.current?.localParticipant
+        .getTrackPublication(Track.Source.ScreenShareAudio)
+        ?.audioTrack?.getRTCStatsReport()
+        .then((stats) => {
+          stats?.forEach((row) => {
+            if (row.type !== "outbound-rtp" || !mounted.current) return;
+            setSound(
+              soundLabel(
+                audio,
+                kbps(row.bytesSent, row.timestamp, sent.current),
+              ),
+            );
+            sent.current = { bytes: row.bytesSent, at: row.timestamp };
           });
         })
         .catch(() => {});
@@ -396,6 +418,11 @@ export default function Studio({ id }: { id: string }) {
                   <span>
                     Отправка <strong>{encoded || "Определяем…"}</strong>
                   </span>
+                  {hasAudio && (
+                    <span>
+                      Звук <strong>{sound || "Определяем…"}</strong>
+                    </span>
+                  )}
                 </div>
               )}
               <div className="separator" />

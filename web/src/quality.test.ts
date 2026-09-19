@@ -4,6 +4,8 @@ import {
   bitrate,
   captureError,
   audioHint,
+  kbps,
+  soundLabel,
   resolutions,
   type Resolution,
 } from "./quality";
@@ -39,5 +41,23 @@ describe("качество трансляции", () => {
     expect(
       captureError(new DOMException("denied", "NotAllowedError")),
     ).toContain("отменён");
+  });
+});
+
+describe("показания звука", () => {
+  it("считает килобиты в секунду по приросту байт", () => {
+    // 16000 байт за секунду = 128 кбит/с — ровно то, что просим у Opus.
+    expect(kbps(16000, 1000, { bytes: 0, at: 0 })).toBe(0);
+    expect(kbps(32000, 2000, { bytes: 16000, at: 1000 })).toBe(128);
+  });
+
+  it("называет частоту и каналы захвата", () => {
+    expect(soundLabel({ sampleRate: 48000, channelCount: 2 }, 128)).toBe(
+      "48 кГц · стерео · 128 кбит/с",
+    );
+    expect(soundLabel({ sampleRate: 16000, channelCount: 1 }, 24)).toBe(
+      "16 кГц · моно · 24 кбит/с",
+    );
+    expect(soundLabel(undefined, 0)).toBe("— · — · 0 кбит/с");
   });
 });
