@@ -25,9 +25,9 @@ export function loadBufferPreference(storage: Storage): BufferPreference {
 }
 
 export function saveBufferPreference(storage: Storage, value: BufferPreference): void {
-  if (value !== null && !isValidBufferPreference(value)) return;
+  const normalized = normalizeBufferPreference(value);
   try {
-    storage.setItem(STORAGE_KEY, JSON.stringify(value));
+    storage.setItem(STORAGE_KEY, JSON.stringify(normalized));
   } catch {
     // Storage can be unavailable in privacy-restricted browser contexts.
   }

@@ -55,4 +55,17 @@ describe("viewer playout buffer", () => {
       expect(receiver.jitterBufferTarget).toBeNull();
     }
   });
+  it("overwrites a stored value with Auto when saving an invalid preference", () => {
+    let stored: string | null = null;
+    const storage = { getItem: () => stored, setItem: (_key: string, value: string) => { stored = value; } } as unknown as Storage;
+    saveBufferPreference(storage, 1.5);
+    saveBufferPreference(storage, 4.1);
+    expect(loadBufferPreference(storage)).toBeNull();
+  });
+  it("normalizes invalid fallback values to Auto and preserves fallback support", () => {
+    const setPlayoutDelay = vi.fn();
+    const track = { receiver: { playoutDelayHint: undefined }, setPlayoutDelay } as unknown as RemoteTrack;
+    expect(applyPlayoutBuffer(track, 4.1)).toBe("playoutDelayHint");
+    expect(setPlayoutDelay).toHaveBeenCalledWith(0);
+  });
 });
