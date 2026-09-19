@@ -9,7 +9,7 @@ export async function applyQuality(track: MediaStreamTrack, settings: StreamSett
     return "";
   } catch (error) {
     if (!(error instanceof Error) || error.name !== "OverconstrainedError") throw error;
-    await track.applyConstraints({ frameRate: { ideal: settings.fps } }).catch(() => {});
+    await track.applyConstraints({ frameRate: { ideal: settings.fps, max: settings.fps } }).catch(() => {});
     return "Источник не поддерживает выбранные параметры. Используются доступные настройки.";
   }
 }

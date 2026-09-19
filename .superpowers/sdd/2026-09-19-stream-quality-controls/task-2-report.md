@@ -55,3 +55,33 @@ failed because `web/src/Studio.tsx` still consumes Task 1's removed legacy quali
 ## Concerns
 
 `Studio.tsx` remains intentionally stale and prevents a whole-web TypeScript build until the planned integration task updates it.
+
+## Fix Round 1
+
+### Finding
+
+Review found that the OverconstrainedError fallback supplied only an FPS ideal, allowing Chrome/Edge to capture above the selected FPS ceiling.
+
+### Code change
+
+Changed the fallback constraints in `web/src/media.ts` to `{ frameRate: { ideal: settings.fps, max: settings.fps } }` and updated both browser fallback assertions in `web/src/media.test.ts`.
+
+### TDD evidence
+
+RED after updating the assertions and before changing production code:
+
+```text
+node node_modules\\vitest\\vitest.mjs run src/media.test.ts
+2 failed, 6 passed (8 tests); received fallback had ideal 60 but no max 60
+```
+
+GREEN after the implementation change:
+
+```text
+node node_modules\\vitest\\vitest.mjs run src/media.test.ts src/quality.test.ts
+2 test files passed; 18 tests passed
+```
+
+### Self-review
+
+The fallback now enforces the user-selected FPS as both preference and ceiling while preserving the existing graceful retry behavior for Firefox and Chrome.

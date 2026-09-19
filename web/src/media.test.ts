@@ -41,7 +41,7 @@ describe("applyQuality", () => {
         "Используются доступные настройки",
       );
       expect(source.applyConstraints).toHaveBeenLastCalledWith({
-        frameRate: { ideal: 60 },
+        frameRate: { ideal: 60, max: 60 },
       });
     });
 
