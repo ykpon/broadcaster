@@ -10,12 +10,16 @@ export async function applyQuality(
     await track.applyConstraints(constraints(res, fps));
     return "";
   } catch (error) {
-    if (
-      !(error instanceof DOMException) ||
-      error.name !== "OverconstrainedError"
-    )
+    // Firefox has no OverconstrainedError interface (MDN BCD: api.OverconstrainedError
+    // firefox = false) and rejects with a plain Error named OverconstrainedError, so an
+    // instanceof DOMException check silently skips the fallback there and kills the
+    // whole broadcast. Chrome and Safari inherit DOMException, which inherits Error.
+    if (!(error instanceof Error) || error.name !== "OverconstrainedError")
       throw error;
-    await track.applyConstraints({ frameRate: { ideal: fps } });
+    // Gecko refuses applyConstraints outright on some capture sources, so the retry can
+    // fail too. The note below is the report; a quality preference is never worth
+    // losing the stream over.
+    await track.applyConstraints({ frameRate: { ideal: fps } }).catch(() => {});
     return "Источник не поддерживает выбранные параметры. Используются доступные настройки.";
   }
 }
