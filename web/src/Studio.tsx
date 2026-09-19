@@ -29,6 +29,7 @@ import {
   resolutions,
   bitrate,
   captureError,
+  audioHint,
   type Resolution,
   type FPS,
 } from "./quality";
@@ -47,6 +48,7 @@ export default function Studio({ id }: { id: string }) {
     [note, setNote] = useState(""),
     [muted, setMuted] = useState(false),
     [hasAudio, setHasAudio] = useState(false),
+    [surface, setSurface] = useState(""),
     [state, setState] = useState(ConnectionState.Disconnected),
     [actual, setActual] = useState(""),
     [encoded, setEncoded] = useState(""),
@@ -180,6 +182,7 @@ export default function Studio({ id }: { id: string }) {
       }
       trackRef.current = await publishScreen(room, stream, res, fps);
       setHasAudio(stream.getAudioTracks().length > 0);
+      setSurface(stream.getVideoTracks()[0].getSettings().displaySurface || "");
       setMuted(false);
       stream.getVideoTracks()[0].onended = () => {
         void finish();
@@ -395,7 +398,7 @@ export default function Studio({ id }: { id: string }) {
                     {live
                       ? hasAudio
                         ? "Передаётся вместе с экраном"
-                        : "Источник не передал аудио"
+                        : audioHint(surface)
                       : "Включите в диалоге выбора"}
                   </small>
                 </div>

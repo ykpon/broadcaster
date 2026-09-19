@@ -3,6 +3,7 @@ import {
   constraints,
   bitrate,
   captureError,
+  audioHint,
   resolutions,
   type Resolution,
 } from "./quality";
@@ -28,6 +29,11 @@ describe("качество трансляции", () => {
   it("выделяет 25 Mbps для 4K60 и меньше для 720p", () => {
     expect(bitrate("2160", 60)).toBe(25_000_000);
     expect(bitrate("720", 30)).toBe(2_500_000);
+  });
+  it("подсказывает про галочку системного звука для экрана и окна", () => {
+    for (const surface of ["monitor", "window", ""])
+      expect(audioHint(surface)).toContain("аудио системы");
+    expect(audioHint("browser")).not.toContain("аудио системы");
   });
   it("объясняет отмену выбора пользователем", () => {
     expect(
