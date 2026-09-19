@@ -33,6 +33,7 @@ export default function Viewer({ id }: { id: string }) {
     [volume, setVolume] = useState(0.8),
     [muted, setMuted] = useState(false),
     [fit, setFit] = useState(false),
+    [idle, setIdle] = useState(false),
     [state, setState] = useState(ConnectionState.Disconnected);
   const roomRef = useRef<Room | null>(null),
     video = useRef<HTMLVideoElement>(null),
@@ -45,6 +46,29 @@ export default function Viewer({ id }: { id: string }) {
     return () => {
       mounted.current = false;
       void roomRef.current?.disconnect();
+    };
+  }, []);
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    const wake = () => {
+      setIdle(false);
+      clearTimeout(timer);
+      timer = setTimeout(() => setIdle(true), 2500);
+    };
+    // Only fullscreen needs this; windowed playback keeps the bar permanently.
+    const track = () => {
+      clearTimeout(timer);
+      document.removeEventListener("mousemove", wake);
+      if (document.fullscreenElement) {
+        document.addEventListener("mousemove", wake);
+        wake();
+      } else setIdle(false);
+    };
+    document.addEventListener("fullscreenchange", track);
+    return () => {
+      document.removeEventListener("fullscreenchange", track);
+      document.removeEventListener("mousemove", wake);
+      clearTimeout(timer);
     };
   }, []);
   useEffect(() => {
@@ -153,7 +177,10 @@ export default function Viewer({ id }: { id: string }) {
           </div>
           <CopyButton value={location.href} label="Пригласить" />
         </div>
-        <div ref={player} className="player viewer-player">
+        <div
+          ref={player}
+          className={`player viewer-player${idle ? " idle" : ""}`}
+        >
           <div className="video-stage">
             <video
               ref={video}

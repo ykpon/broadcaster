@@ -947,6 +947,7 @@ footer a {
   white-space: nowrap;
 }
 .player:fullscreen {
+  position: relative;
   border: 0;
   border-radius: 0;
   background: #000;
@@ -958,6 +959,29 @@ footer a {
 .player:fullscreen .video-stage {
   flex: 1;
   aspect-ratio: auto;
+  min-height: 0;
+}
+/* In flow the bar steals height from the video and letterboxes it; float it over
+   the picture instead so fullscreen really is full screen. */
+.player:fullscreen .viewer-controls {
+  position: absolute;
+  inset: auto 0 0 0;
+  border-top: 0;
+  background: linear-gradient(transparent, rgb(0 0 0 / 0.78));
+  transition: opacity 0.25s ease;
+}
+/* Fullscreen keeps the pointer over the player forever, so :hover can never retract
+   the bar. The idle class comes from a timer in Viewer.tsx. */
+.player:fullscreen.idle .viewer-controls {
+  opacity: 0;
+  pointer-events: none;
+}
+.player:fullscreen.idle {
+  cursor: none;
+}
+/* Clear the now-floating control bar. */
+.player:fullscreen .playback-button {
+  bottom: 86px;
 }
 .waiting-dots {
   display: flex;
