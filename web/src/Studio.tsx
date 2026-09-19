@@ -179,6 +179,8 @@ export default function Studio({ id }: { id: string }) {
         return;
       }
       trackRef.current = await publishScreen(room, stream, res, fps);
+      // ponytail: temporary debug handle for encoder diagnosis, delete after
+      Object.assign(window, { __lk: trackRef.current });
       setHasAudio(stream.getAudioTracks().length > 0);
       setMuted(false);
       stream.getVideoTracks()[0].onended = () => {
