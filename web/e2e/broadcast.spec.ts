@@ -103,6 +103,15 @@ test("реальный SFU: публикация тестового видео �
     )
     .toBeGreaterThan(0);
   await expect(viewer.getByText("Видео и звук", { exact: true })).toBeVisible();
+  await expect(viewer.getByLabel("Буфер воспроизведения")).toBeEnabled();
+  await viewer.getByLabel("Буфер воспроизведения").fill("10");
+  await expect(viewer.getByText("1.0 с", { exact: true })).toBeVisible();
+  await expect(
+    viewer.getByRole("heading", { name: "Диагностика приёма" }),
+  ).toBeVisible();
+  await expect(
+    viewer.getByText("Пакеты получены", { exact: true }),
+  ).toBeVisible();
   await viewer.getByLabel("Громкость").fill("0.35");
   await expect
     .poll(() =>

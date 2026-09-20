@@ -22,6 +22,21 @@ import {
 import { Header, ErrorBox, CopyButton, Scene } from "./shared";
 import { useRoomInfo, roomStateLabel } from "./room";
 import { api, message, type Connection } from "./api";
+import {
+  applyPlayoutBuffer,
+  applyPlayoutBufferToTracks,
+  loadBufferPreference,
+  saveBufferPreference,
+  type BufferPreference,
+  type PlayoutSupport,
+} from "./playout";
+import {
+  formatMetric,
+  parseInboundStats,
+  type CounterSample,
+  type StreamMetrics,
+} from "./stats";
+import { createIncomingStatsTracker } from "./viewerRuntime";
 export default function Viewer({ id }: { id: string }) {
   const { info, error: infoError } = useRoomInfo(id);
   const [error, setError] = useState(""),
@@ -34,17 +49,64 @@ export default function Viewer({ id }: { id: string }) {
     [muted, setMuted] = useState(false),
     [fit, setFit] = useState(false),
     [idle, setIdle] = useState(false),
+    [buffer, setBuffer] = useState<BufferPreference>(() =>
+      loadBufferPreference(localStorage),
+    ),
+    [playoutSupport, setPlayoutSupport] = useState<PlayoutSupport | "unknown">(
+      "unknown",
+    ),
+    [videoMetrics, setVideoMetrics] = useState<StreamMetrics>({}),
+    [audioMetrics, setAudioMetrics] = useState<StreamMetrics>({}),
     [state, setState] = useState(ConnectionState.Disconnected);
   const roomRef = useRef<Room | null>(null),
     video = useRef<HTMLVideoElement>(null),
     audio = useRef<HTMLAudioElement>(null),
     player = useRef<HTMLDivElement>(null),
+    bufferRef = useRef(buffer),
+    remoteTracks = useRef(new Set<RemoteTrack>()),
+    videoStats = useRef(
+      createIncomingStatsTracker<RemoteTrack, CounterSample>(),
+    ),
+    audioStats = useRef(
+      createIncomingStatsTracker<RemoteTrack, CounterSample>(),
+    ),
     mounted = useRef(true);
   const ended = info?.state === "ended";
+
+  function replaceStatsTrack(kind: Track.Kind, track: RemoteTrack | null) {
+    const tracker =
+      kind === Track.Kind.Video ? videoStats.current : audioStats.current;
+    if (!tracker.replace(track)) return;
+    if (kind === Track.Kind.Video) setVideoMetrics({});
+    else setAudioMetrics({});
+  }
+
+  function resetRemoteState(updateUi = true) {
+    remoteTracks.current.clear();
+    videoStats.current.replace(null);
+    audioStats.current.replace(null);
+    if (!updateUi) return;
+    setHasVideo(false);
+    setHasAudio(false);
+    setVideoMetrics({});
+    setAudioMetrics({});
+    setPlayoutSupport("unknown");
+  }
+
+  function refreshPlayoutSupport() {
+    const tracks = [...remoteTracks.current];
+    setPlayoutSupport(
+      tracks.length === 0
+        ? "unknown"
+        : applyPlayoutBufferToTracks(tracks, bufferRef.current),
+    );
+  }
+
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      resetRemoteState(false);
       void roomRef.current?.disconnect();
     };
   }, []);
@@ -80,40 +142,101 @@ export default function Viewer({ id }: { id: string }) {
   useEffect(() => {
     if (ended) {
       void roomRef.current?.disconnect();
-      setHasVideo(false);
+      resetRemoteState();
       setJoined(false);
     }
   }, [ended]);
+  useEffect(() => {
+    if (!joined) return;
+    const poll = (
+      tracker: ReturnType<
+        typeof createIncomingStatsTracker<RemoteTrack, CounterSample>
+      >,
+      setMetrics: (metrics: StreamMetrics) => void,
+    ) => {
+      const track = tracker.current();
+      if (!track) return;
+      const read = tracker.capture(track);
+      void track
+        .getRTCStatsReport()
+        .then((report) => {
+          if (!report || !mounted.current) return;
+          const parsed = parseInboundStats(
+            Array.from(report.values()),
+            read.previous,
+          );
+          if (!tracker.commit(read, parsed.sample)) return;
+          setMetrics(parsed.metrics);
+        })
+        .catch(() => {});
+    };
+    const timer = setInterval(() => {
+      poll(videoStats.current, setVideoMetrics);
+      poll(audioStats.current, setAudioMetrics);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [joined]);
+
+  function changeBuffer(value: string) {
+    const tenths = Number(value);
+    const next = tenths === 0 ? null : tenths / 10;
+    bufferRef.current = next;
+    setBuffer(next);
+    saveBufferPreference(localStorage, next);
+    refreshPlayoutSupport();
+  }
+
   async function join() {
     setBusy(true);
     setError("");
     await roomRef.current?.disconnect();
-    setHasVideo(false);
-    setHasAudio(false);
+    resetRemoteState();
+    setBlocked(false);
     const room = new Room({ adaptiveStream: false });
     roomRef.current = room;
     room.on(RoomEvent.ConnectionStateChanged, setState);
     room.on(RoomEvent.TrackSubscribed, (track: RemoteTrack) => {
+      if (!mounted.current || roomRef.current !== room) return;
+      remoteTracks.current.add(track);
+      const trackSupport = applyPlayoutBuffer(track, bufferRef.current);
+      if (remoteTracks.current.size === 1) setPlayoutSupport(trackSupport);
+      else refreshPlayoutSupport();
       if (track.kind === Track.Kind.Video && video.current) {
+        replaceStatsTrack(Track.Kind.Video, track);
         track.attach(video.current);
         setHasVideo(true);
         void video.current.play().catch(() => setBlocked(true));
       }
       if (track.kind === Track.Kind.Audio && audio.current) {
+        replaceStatsTrack(Track.Kind.Audio, track);
         track.attach(audio.current);
         setHasAudio(true);
         void audio.current.play().catch(() => setBlocked(true));
       }
     });
     room.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
+      if (!mounted.current || roomRef.current !== room) return;
+      remoteTracks.current.delete(track);
       track.detach();
-      if (track.kind === Track.Kind.Video) setHasVideo(false);
-      else setHasAudio(false);
+      if (
+        track.kind === Track.Kind.Video &&
+        videoStats.current.current() === track
+      ) {
+        replaceStatsTrack(Track.Kind.Video, null);
+        setHasVideo(false);
+      } else if (
+        track.kind === Track.Kind.Audio &&
+        audioStats.current.current() === track
+      ) {
+        replaceStatsTrack(Track.Kind.Audio, null);
+        setHasAudio(false);
+      }
+      refreshPlayoutSupport();
     });
     room.on(RoomEvent.Disconnected, () => {
-      if (mounted.current) {
+      if (mounted.current && roomRef.current === room) {
         setJoined(false);
-        setHasVideo(false);
+        resetRemoteState();
       }
     });
     try {
@@ -155,6 +278,10 @@ export default function Viewer({ id }: { id: string }) {
       );
     }
   }
+  const receivedVideo =
+    videoMetrics.width !== undefined || videoMetrics.height !== undefined
+      ? `${formatMetric(videoMetrics.width)} × ${formatMetric(videoMetrics.height)} · ${formatMetric(videoMetrics.fps, " FPS")}`
+      : "—";
   return (
     <div className="app">
       <Header>
@@ -309,6 +436,105 @@ export default function Viewer({ id }: { id: string }) {
             </div>
           </div>
         </div>
+        <section
+          className="viewer-diagnostics"
+          aria-labelledby="viewer-diagnostics-title"
+        >
+          <div className="viewer-buffer">
+            <div className="viewer-diagnostics-heading">
+              <h2 id="viewer-diagnostics-title">Диагностика приёма</h2>
+              <output htmlFor="playout-buffer">
+                {buffer === null ? "Авто" : `${buffer.toFixed(1)} с`}
+              </output>
+            </div>
+            <label htmlFor="playout-buffer">Буфер воспроизведения</label>
+            <input
+              id="playout-buffer"
+              aria-label="Буфер воспроизведения"
+              type="range"
+              min="0"
+              max="40"
+              step="1"
+              value={buffer === null ? 0 : Math.round(buffer * 10)}
+              disabled={playoutSupport === "unsupported"}
+              onChange={(event) => changeBuffer(event.currentTarget.value)}
+            />
+            <div className="range-scale">
+              <span>Авто</span>
+              <span>4.0 с</span>
+            </div>
+            {playoutSupport === "unsupported" && (
+              <p className="viewer-buffer-note">
+                Браузер использует автоматический буфер
+              </p>
+            )}
+          </div>
+          <div className="viewer-metrics">
+            <div className="metric-group" aria-label="Видео">
+              <h3>Видео</h3>
+              <span className="metric-row">
+                Кодек <strong>{videoMetrics.codec ?? "—"}</strong>
+              </span>
+              <span className="metric-row">
+                Битрейт
+                <strong>
+                  {formatMetric(videoMetrics.bitrateKbps, " кбит/с")}
+                </strong>
+              </span>
+              <span className="metric-row">
+                Разрешение / FPS <strong>{receivedVideo}</strong>
+              </span>
+              <span className="metric-row">
+                <span>Пакеты получены</span>
+                <strong>{formatMetric(videoMetrics.packets)}</strong>
+              </span>
+              <span className="metric-row">
+                Потеряно{" "}
+                <strong>{formatMetric(videoMetrics.packetsLost)}</strong>
+              </span>
+              <span className="metric-row">
+                Пропущено кадров
+                <strong>{formatMetric(videoMetrics.droppedFrames)}</strong>
+              </span>
+              <span className="metric-row">
+                Jitter{" "}
+                <strong>{formatMetric(videoMetrics.jitterMs, " мс")}</strong>
+              </span>
+              <span className="metric-row">
+                Фактический буфер
+                <strong>{formatMetric(videoMetrics.bufferMs, " мс")}</strong>
+              </span>
+            </div>
+            <div className="metric-group" aria-label="Аудио">
+              <h3>Аудио</h3>
+              <span className="metric-row">
+                Кодек <strong>{audioMetrics.codec ?? "—"}</strong>
+              </span>
+              <span className="metric-row">
+                Битрейт
+                <strong>
+                  {formatMetric(audioMetrics.bitrateKbps, " кбит/с")}
+                </strong>
+              </span>
+              <span className="metric-row">
+                Пакеты аудио{" "}
+                <strong>{formatMetric(audioMetrics.packets)}</strong>
+              </span>
+              <span className="metric-row">
+                Потеряно аудио
+                <strong>{formatMetric(audioMetrics.packetsLost)}</strong>
+              </span>
+              <span className="metric-row">
+                Jitter{" "}
+                <strong>{formatMetric(audioMetrics.jitterMs, " мс")}</strong>
+              </span>
+              <span className="metric-row">
+                Фактический буфер
+                <strong>{formatMetric(audioMetrics.bufferMs, " мс")}</strong>
+              </span>
+            </div>
+          </div>
+        </section>
         <ErrorBox error={error || infoError} />
         <div className="viewer-note">
           <ShieldCheck size={15} /> Комната доступна только по ссылке.
