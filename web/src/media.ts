@@ -20,6 +20,29 @@ export type QualityUpdateResult = {
   videoRepublished: boolean;
 };
 
+export type RoutedDisplayMediaOptions = DisplayMediaStreamOptions & {
+  systemAudio: "include";
+  windowAudio: "window";
+};
+
+export function displayCaptureOptions(): RoutedDisplayMediaOptions {
+  return {
+    video: true,
+    // Keep tab/game/music dynamics intact. The top-level routing hints make
+    // tabs use tab audio, supported windows use window audio, and monitors use
+    // the system mix. Browsers that do not know windowAudio ignore it and keep
+    // their legacy system-audio fallback.
+    audio: {
+      channelCount: 2,
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    },
+    systemAudio: "include",
+    windowAudio: "window",
+  };
+}
+
 const videoSettingsChanged = (previous: StreamSettings, next: StreamSettings) =>
   previous.resolution !== next.resolution ||
   previous.fps !== next.fps ||

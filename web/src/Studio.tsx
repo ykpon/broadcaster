@@ -30,6 +30,7 @@ import {
 } from "./quality";
 import {
   applyQuality,
+  displayCaptureOptions,
   publishScreen,
   updateQuality,
   type QualityUpdateResult,
@@ -285,18 +286,9 @@ export default function Studio({ id }: { id: string }) {
           "Захват экрана требует HTTPS или localhost и поддерживаемый настольный браузер.",
         );
       // Capture first, while the click still provides user activation.
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        // Chrome's voice chain (gain control, noise suppression, echo cancel) is built
-        // for a talking head and squashes the dynamics out of game and music audio.
-        // Plain values are "ideal", so a source that ignores them still starts.
-        audio: {
-          channelCount: 2,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-      });
+      stream = await navigator.mediaDevices.getDisplayMedia(
+        displayCaptureOptions(),
+      );
       if (!mounted.current) {
         stream.getTracks().forEach((t) => t.stop());
         return;
@@ -730,10 +722,8 @@ export default function Studio({ id }: { id: string }) {
                   <strong>Звук источника</strong>
                   <small>
                     {live
-                      ? hasAudio
-                        ? "Передаётся вместе с экраном"
-                        : audioHint(surface)
-                      : "Включите в диалоге выбора"}
+                      ? audioHint(surface, hasAudio)
+                      : "Источник звука определяется выбранной вкладкой, окном или экраном"}
                   </small>
                 </div>
                 <button

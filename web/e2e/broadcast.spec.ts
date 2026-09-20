@@ -13,7 +13,12 @@ test("реальный SFU: публикация тестового видео �
   // Only the OS capture source is substituted. API, JWT, WebSocket, ICE,
   // encoding, SFU forwarding, and decoding all use the real Docker stack.
   await page.addInitScript(() => {
-    navigator.mediaDevices.getDisplayMedia = async () => {
+    navigator.mediaDevices.getDisplayMedia = async (options) => {
+      (
+        window as Window & {
+          __displayMediaOptions?: DisplayMediaStreamOptions;
+        }
+      ).__displayMediaOptions = options;
       const canvas = document.createElement("canvas");
       canvas.width = 1280;
       canvas.height = 720;
@@ -75,6 +80,24 @@ test("реальный SFU: публикация тестового видео �
   await expect(page.getByText("В прямом эфире", { exact: true })).toBeVisible({
     timeout: 30000,
   });
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as Window & {
+              __displayMediaOptions?: DisplayMediaStreamOptions & {
+                systemAudio?: string;
+                windowAudio?: string;
+              };
+            }
+          ).__displayMediaOptions,
+      ),
+    )
+    .toMatchObject({
+      systemAudio: "include",
+      windowAudio: "window",
+    });
   await expect(page.getByLabel("Кодек")).toBeDisabled();
   await expect(
     page.getByRole("heading", { name: "Диагностика отправки" }),

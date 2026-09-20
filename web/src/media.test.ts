@@ -9,10 +9,27 @@ import {
 import { DEFAULT_STREAM_SETTINGS } from "./quality";
 import {
   applyQuality,
+  displayCaptureOptions,
   publishScreen,
   updateQuality,
   type PublishedTracks,
 } from "./media";
+
+describe("display audio routing", () => {
+  it("requests tab audio, window-only audio, and system audio for monitors", () => {
+    expect(displayCaptureOptions()).toEqual({
+      video: true,
+      audio: {
+        channelCount: 2,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+      systemAudio: "include",
+      windowAudio: "window",
+    });
+  });
+});
 
 // Gecko rejects with a plain Error: Firefox exposes no OverconstrainedError
 // interface at all (MDN BCD api.OverconstrainedError → firefox: false).

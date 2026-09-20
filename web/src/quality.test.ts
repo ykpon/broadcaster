@@ -101,10 +101,13 @@ describe("качество трансляции", () => {
       "2160",
     ]);
   });
-  it("подсказывает про галочку системного звука для экрана и окна", () => {
-    for (const surface of ["monitor", "window", ""])
-      expect(audioHint(surface)).toContain("аудио системы");
-    expect(audioHint("browser")).not.toContain("аудио системы");
+  it("объясняет фактическую маршрутизацию захваченного звука", () => {
+    expect(audioHint("browser", true)).toContain("выбранной вкладки");
+    expect(audioHint("window", true)).toContain("выбранного окна");
+    expect(audioHint("window", true)).toContain("весь звук системы");
+    expect(audioHint("monitor", true)).toContain("весь звук системы");
+    expect(audioHint("monitor", true)).toContain("Discord");
+    expect(audioHint("browser", false)).toContain("включите передачу звука");
   });
   it("объясняет отмену выбора пользователем", () => {
     expect(

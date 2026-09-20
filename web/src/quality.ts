@@ -135,11 +135,19 @@ export function captureError(error: unknown) {
     ? error.message
     : "Не удалось начать трансляцию";
 }
-// Chrome offers system audio only on Windows, and only when the user ticks the box in
-// the picker; macOS cannot capture it at all. Firefox has no display audio anywhere.
-// The browser gives us no way to ask afterwards, so name the surface and let the user act.
-export function audioHint(surface: string) {
+export function audioHint(surface: string, hasAudio: boolean) {
+  if (hasAudio) {
+    if (surface === "browser")
+      return "Передаётся звук только выбранной вкладки.";
+    if (surface === "window")
+      return "Передаётся звук выбранного окна; если браузер не поддерживает изоляцию — весь звук системы.";
+    if (surface === "monitor")
+      return "Передаётся весь звук системы, включая Discord и другие приложения.";
+    return "Передаётся звук, выбранный в диалоге браузера.";
+  }
   if (surface === "browser")
-    return "Вкладка молчала при выборе — звук пойдёт, как только в ней заиграет.";
-  return "Нет звука: в диалоге выбора включите «Также передать аудио системы». Для всего экрана это работает в Chrome на Windows; на macOS выберите вкладку браузера.";
+    return "Нет звука: при выборе источника включите передачу звука выбранной вкладки.";
+  if (surface === "window")
+    return "Нет звука: включите передачу звука окна; без поддержки изоляции браузер предложит весь звук системы.";
+  return "Нет звука: в диалоге выбора включите передачу аудио системы.";
 }
