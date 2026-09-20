@@ -25,8 +25,6 @@ import { api, message, type Connection } from "./api";
 import {
   applyPlayoutBuffer,
   applyPlayoutBufferToTracks,
-  loadBufferPreference,
-  saveBufferPreference,
   type BufferPreference,
   type PlayoutSupport,
 } from "./playout";
@@ -36,7 +34,11 @@ import {
   type CounterSample,
   type StreamMetrics,
 } from "./stats";
-import { createIncomingStatsTracker } from "./viewerRuntime";
+import {
+  createIncomingStatsTracker,
+  loadBufferPreferenceSafely,
+  saveBufferPreferenceSafely,
+} from "./viewerRuntime";
 export default function Viewer({ id }: { id: string }) {
   const { info, error: infoError } = useRoomInfo(id);
   const [error, setError] = useState(""),
@@ -50,7 +52,7 @@ export default function Viewer({ id }: { id: string }) {
     [fit, setFit] = useState(false),
     [idle, setIdle] = useState(false),
     [buffer, setBuffer] = useState<BufferPreference>(() =>
-      loadBufferPreference(localStorage),
+      loadBufferPreferenceSafely(() => window.localStorage),
     ),
     [playoutSupport, setPlayoutSupport] = useState<PlayoutSupport | "unknown">(
       "unknown",
@@ -182,7 +184,7 @@ export default function Viewer({ id }: { id: string }) {
     const next = tenths === 0 ? null : tenths / 10;
     bufferRef.current = next;
     setBuffer(next);
-    saveBufferPreference(localStorage, next);
+    saveBufferPreferenceSafely(() => window.localStorage, next);
     refreshPlayoutSupport();
   }
 

@@ -1,5 +1,29 @@
 import { describe, expect, it } from "vitest";
-import { createIncomingStatsTracker } from "./viewerRuntime";
+import {
+  createIncomingStatsTracker,
+  loadBufferPreferenceSafely,
+  saveBufferPreferenceSafely,
+} from "./viewerRuntime";
+
+describe("Viewer storage acquisition", () => {
+  const blockedStorage = () => {
+    throw new DOMException("Storage access denied", "SecurityError");
+  };
+
+  it("uses Auto when acquiring localStorage throws", () => {
+    expect(loadBufferPreferenceSafely(blockedStorage)).toBeNull();
+  });
+
+  it("swallows acquisition failure so playout application continues", () => {
+    const applied: Array<number | null> = [];
+
+    expect(() => {
+      saveBufferPreferenceSafely(blockedStorage, 1.2);
+      applied.push(1.2);
+    }).not.toThrow();
+    expect(applied).toEqual([1.2]);
+  });
+});
 
 describe("Viewer incoming stats lifecycle", () => {
   it("resets samples on track replacement and rejects stale reports", () => {

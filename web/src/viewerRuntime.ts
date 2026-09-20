@@ -1,3 +1,32 @@
+import {
+  loadBufferPreference,
+  saveBufferPreference,
+  type BufferPreference,
+} from "./playout";
+
+type StorageGetter = () => Storage;
+
+export function loadBufferPreferenceSafely(
+  getStorage: StorageGetter,
+): BufferPreference {
+  try {
+    return loadBufferPreference(getStorage());
+  } catch {
+    return null;
+  }
+}
+
+export function saveBufferPreferenceSafely(
+  getStorage: StorageGetter,
+  value: BufferPreference,
+): void {
+  try {
+    saveBufferPreference(getStorage(), value);
+  } catch {
+    // Acquiring localStorage can itself throw in restricted browser contexts.
+  }
+}
+
 export type IncomingStatsRead<T, S> = {
   generation: number;
   track: T;
