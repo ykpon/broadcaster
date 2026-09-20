@@ -71,6 +71,7 @@ export default function Studio({ id }: { id: string }) {
   const [settings, setSettings] = useState<StreamSettings>(() =>
       loadStreamSettings(localStorage),
     ),
+    [appliedSettings, setAppliedSettings] = useState(settings),
     [busy, setBusy] = useState(false),
     [live, setLive] = useState(false),
     [ended, setEnded] = useState(false),
@@ -112,9 +113,13 @@ export default function Studio({ id }: { id: string }) {
         sameSettings(left.settings, right.settings),
       onBusy: setBusy,
       onStart: () => setError(""),
-      onSuccess: (update, nextNote) => {
+      onApplied: (update) => {
         if (tracksRef.current !== update.tracks) return;
         confirmedSettings.current = update.settings;
+        setAppliedSettings(update.settings);
+      },
+      onSuccess: (update, nextNote) => {
+        if (tracksRef.current !== update.tracks) return;
         setNote(nextNote);
       },
       onFailure: (failure, confirmed, shouldRestoreDraft, failed) => {
@@ -309,6 +314,7 @@ export default function Studio({ id }: { id: string }) {
       }
       tracksRef.current = await publishScreen(room, stream, settings);
       confirmedSettings.current = settings;
+      setAppliedSettings(settings);
       setHasAudio(stream.getAudioTracks().length > 0);
       setSurface(stream.getVideoTracks()[0].getSettings().displaySurface || "");
       setMuted(false);
@@ -741,7 +747,8 @@ export default function Studio({ id }: { id: string }) {
                     </strong>
                   </span>
                   <span className="metric-row">
-                    Предел <strong>{settings.videoBitrateMbps} Мбит/с</strong>
+                    Предел{" "}
+                    <strong>{appliedSettings.videoBitrateMbps} Мбит/с</strong>
                   </span>
                   <span className="metric-row">
                     Захват <strong>{captureVideo || "—"}</strong>
@@ -791,7 +798,7 @@ export default function Studio({ id }: { id: string }) {
                   </span>
                   <span className="metric-row">
                     Предел аудио{" "}
-                    <strong>{settings.audioBitrateKbps} кбит/с</strong>
+                    <strong>{appliedSettings.audioBitrateKbps} кбит/с</strong>
                   </span>
                   <span className="metric-row">
                     Захват аудио <strong>{captureAudio || "—"}</strong>

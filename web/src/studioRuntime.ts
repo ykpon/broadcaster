@@ -5,6 +5,7 @@ export type LatestSettingsUpdaterOptions<T, R> = {
   equals?: (left: T, right: T) => boolean;
   onBusy: (busy: boolean) => void;
   onStart: (next: T) => void;
+  onApplied?: (next: T) => void;
   onSuccess: (next: T, result: R) => void;
   onFailure: (
     error: unknown,
@@ -28,7 +29,9 @@ export function createLatestSettingsUpdater<T, R>(
         pending = undefined;
         options.onStart(next);
         try {
-          options.onSuccess(next, await options.apply(next));
+          const result = await options.apply(next);
+          options.onApplied?.(next);
+          options.onSuccess(next, result);
         } catch (error) {
           const confirmed = options.readConfirmed(next);
           await options.rollback(confirmed).catch(() => {});

@@ -16,6 +16,58 @@ function deferred<T>() {
 }
 
 describe("Studio settings updates", () => {
+  it("notifies applied state only after a successful media mutation", async () => {
+    const update = deferred<string>();
+    const notifications: number[] = [];
+    let applied = 10;
+    const updater = createLatestSettingsUpdater<number, string>({
+      apply: () => update.promise,
+      rollback: async () => {},
+      readConfirmed: () => applied,
+      onBusy: () => {},
+      onStart: () => {},
+      onApplied: (next) => {
+        notifications.push(next);
+        applied = next;
+      },
+      onSuccess: () => {},
+      onFailure: () => {},
+    });
+
+    const running = updater.enqueue(20);
+    expect(applied).toBe(10);
+    expect(notifications).toEqual([]);
+
+    update.resolve("updated");
+    await running;
+    expect(applied).toBe(20);
+    expect(notifications).toEqual([20]);
+  });
+
+  it("does not advance applied state when the media mutation fails", async () => {
+    const notifications: number[] = [];
+    let applied = 10;
+    const updater = createLatestSettingsUpdater<number, void>({
+      apply: async () => {
+        throw new Error("failed");
+      },
+      rollback: async () => {},
+      readConfirmed: () => applied,
+      onBusy: () => {},
+      onStart: () => {},
+      onApplied: (next) => {
+        notifications.push(next);
+        applied = next;
+      },
+      onSuccess: () => {},
+      onFailure: () => {},
+    });
+
+    await updater.enqueue(20);
+    expect(applied).toBe(10);
+    expect(notifications).toEqual([]);
+  });
+
   it("skips an idle confirmed value but queues a revert behind an in-flight update", async () => {
     const first = deferred<void>();
     const applied: number[] = [];
@@ -30,9 +82,10 @@ describe("Studio settings updates", () => {
       equals: Object.is,
       onBusy: () => {},
       onStart: () => {},
-      onSuccess: (next) => {
+      onApplied: (next) => {
         confirmed = next;
       },
+      onSuccess: () => {},
       onFailure: () => {},
     });
 
@@ -54,6 +107,7 @@ describe("Studio settings updates", () => {
     const applied: number[] = [];
     const rolledBack: number[] = [];
     const events: string[] = [];
+    const appliedNotifications: number[] = [];
     const busy: boolean[] = [];
     const restoreDraft: boolean[] = [];
     let confirmed = 10;
@@ -76,9 +130,11 @@ describe("Studio settings updates", () => {
       onStart: () => {
         error = "";
       },
-      onSuccess: (next) => {
+      onApplied: (next) => {
+        appliedNotifications.push(next);
         confirmed = next;
       },
+      onSuccess: () => {},
       onFailure: (_failure, previous, shouldRestoreDraft) => {
         restoreDraft.push(shouldRestoreDraft);
         if (shouldRestoreDraft) draft = previous;
@@ -98,6 +154,7 @@ describe("Studio settings updates", () => {
     expect(applied).toEqual([20, 30]);
     expect(rolledBack).toEqual([10]);
     expect(events).toEqual(["apply:20", "rollback:10", "apply:30"]);
+    expect(appliedNotifications).toEqual([30]);
     expect(restoreDraft).toEqual([false]);
     expect(confirmed).toBe(30);
     expect(draft).toBe(30);
@@ -118,9 +175,10 @@ describe("Studio settings updates", () => {
       readConfirmed: () => confirmed,
       onBusy: () => {},
       onStart: () => {},
-      onSuccess: (next) => {
+      onApplied: (next) => {
         confirmed = next;
       },
+      onSuccess: () => {},
       onFailure: () => {},
     });
 
@@ -157,12 +215,26 @@ describe("Studio stats sessions", () => {
     expect(metrics).toBeUndefined();
   });
 
-  it("rejects a report when the published track has been replaced", () => {
+  it("keeps a replaced track's pending report from replacing metrics or samples", async () => {
     const guard = createStatsSessionGuard<object>();
-    const currentTrack = {};
-    const currentRead = guard.capture(currentTrack);
-    expect(guard.isCurrent(currentRead, currentTrack)).toBe(true);
-    expect(guard.isCurrent(currentRead, {})).toBe(false);
+    const trackA = {};
+    const trackB = {};
+    let currentTrack = trackA;
+    const pendingReport = deferred<number>();
+    const read = guard.capture(trackA);
+    let metrics: number | undefined;
+    let sample: number | undefined;
+    const update = pendingReport.promise.then((value) => {
+      if (!guard.isCurrent(read, currentTrack)) return;
+      sample = value;
+      metrics = value;
+    });
+
+    currentTrack = trackB;
+    pendingReport.resolve(42);
+    await update;
+    expect(sample).toBeUndefined();
+    expect(metrics).toBeUndefined();
   });
 });
 

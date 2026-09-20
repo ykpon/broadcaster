@@ -86,10 +86,10 @@ test("реальный SFU: публикация тестового видео �
   const liveVideoBitrate = page.getByLabel("Видеобитрейт");
   await liveVideoBitrate.fill("24");
   await liveVideoBitrate.dispatchEvent("pointerup");
-  await expect(liveVideoBitrate).toHaveValue("24");
   await expect(
     diagnostics.getByText("24 Мбит/с", { exact: true }),
   ).toBeVisible();
+  await expect(liveVideoBitrate).toHaveValue("24");
   await expect(
     page.getByRole("button", { name: "Завершить эфир", exact: true }),
   ).toBeEnabled();
