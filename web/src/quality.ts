@@ -32,7 +32,10 @@ export const SETTING_RANGES = {
   balance: { min: 0, max: 100, step: 1 },
 } as const;
 
-const isValidNumber = (value: unknown, range: { min: number; max: number; step: number }) =>
+const isValidNumber = (
+  value: unknown,
+  range: { min: number; max: number; step: number },
+) =>
   typeof value === "number" &&
   Number.isFinite(value) &&
   value >= range.min &&
@@ -42,29 +45,46 @@ const isValidNumber = (value: unknown, range: { min: number; max: number; step: 
 export function normalizeStreamSettings(value: unknown): StreamSettings {
   if (!value || typeof value !== "object") return DEFAULT_STREAM_SETTINGS;
   const settings = value as Partial<StreamSettings>;
-  const resolution = RESOLUTION_STEPS.some((item) => item.value === settings.resolution);
-  const codec = settings.codec === "vp8" || settings.codec === "vp9" || settings.codec === "av1";
+  const resolution = RESOLUTION_STEPS.some(
+    (item) => item.value === settings.resolution,
+  );
+  const codec =
+    settings.codec === "vp8" ||
+    settings.codec === "vp9" ||
+    settings.codec === "av1";
   if (
     !resolution ||
     !codec ||
     !isValidNumber(settings.fps, SETTING_RANGES.fps) ||
-    !isValidNumber(settings.videoBitrateMbps, SETTING_RANGES.videoBitrateMbps) ||
-    !isValidNumber(settings.audioBitrateKbps, SETTING_RANGES.audioBitrateKbps) ||
+    !isValidNumber(
+      settings.videoBitrateMbps,
+      SETTING_RANGES.videoBitrateMbps,
+    ) ||
+    !isValidNumber(
+      settings.audioBitrateKbps,
+      SETTING_RANGES.audioBitrateKbps,
+    ) ||
     !isValidNumber(settings.balance, SETTING_RANGES.balance)
-  ) return DEFAULT_STREAM_SETTINGS;
+  )
+    return DEFAULT_STREAM_SETTINGS;
   return settings as StreamSettings;
 }
 
 export function loadStreamSettings(storage: Storage): StreamSettings {
   try {
     const raw = storage.getItem(STREAM_SETTINGS_KEY);
-    return raw === null ? DEFAULT_STREAM_SETTINGS : normalizeStreamSettings(JSON.parse(raw));
+    return raw === null
+      ? DEFAULT_STREAM_SETTINGS
+      : normalizeStreamSettings(JSON.parse(raw));
   } catch {
     return DEFAULT_STREAM_SETTINGS;
   }
 }
 
-export function saveStreamSettings(storage: Storage, settings: StreamSettings): void {
+export function saveStreamSettings(
+  storage: Storage,
+  settings: StreamSettings,
+): void {
   try {
     storage.setItem(STREAM_SETTINGS_KEY, JSON.stringify(settings));
   } catch {
@@ -77,14 +97,19 @@ export function qualityHints(balance: number): {
   degradationPreference: RTCDegradationPreference;
 } {
   if (balance < 40)
-    return { contentHint: "detail", degradationPreference: "maintain-resolution" };
+    return {
+      contentHint: "detail",
+      degradationPreference: "maintain-resolution",
+    };
   if (balance <= 60)
     return { contentHint: "motion", degradationPreference: "balanced" };
   return { contentHint: "motion", degradationPreference: "maintain-framerate" };
 }
 
 export function constraints(settings: StreamSettings): MediaTrackConstraints {
-  const size = RESOLUTION_STEPS.find((item) => item.value === settings.resolution)!;
+  const size = RESOLUTION_STEPS.find(
+    (item) => item.value === settings.resolution,
+  )!;
   return {
     width: { ideal: size.width, max: size.width },
     height: { ideal: size.height, max: size.height },

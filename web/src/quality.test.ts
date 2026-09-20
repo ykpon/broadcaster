@@ -19,11 +19,19 @@ function memoryStorage(initial?: string): Storage {
   let value = initial ?? null;
   return {
     getItem: () => value,
-    setItem: (_key, next) => { value = next; },
-    removeItem: () => { value = null; },
-    clear: () => { value = null; },
+    setItem: (_key, next) => {
+      value = next;
+    },
+    removeItem: () => {
+      value = null;
+    },
+    clear: () => {
+      value = null;
+    },
     key: () => null,
-    get length() { return value === null ? 0 : 1; },
+    get length() {
+      return value === null ? 0 : 1;
+    },
   };
 }
 
@@ -32,14 +40,16 @@ describe("качество трансляции", () => {
     expect(loadStreamSettings(memoryStorage("not json"))).toEqual(
       DEFAULT_STREAM_SETTINGS,
     );
-    expect(normalizeStreamSettings({
-      resolution: "9000",
-      fps: 999,
-      videoBitrateMbps: -4,
-      audioBitrateKbps: 7,
-      balance: 1000,
-      codec: "h265",
-    })).toEqual(DEFAULT_STREAM_SETTINGS);
+    expect(
+      normalizeStreamSettings({
+        resolution: "9000",
+        fps: 999,
+        videoBitrateMbps: -4,
+        audioBitrateKbps: 7,
+        balance: 1000,
+        codec: "h265",
+      }),
+    ).toEqual(DEFAULT_STREAM_SETTINGS);
   });
 
   it("сохраняет и читает полный набор настроек", () => {
@@ -72,13 +82,19 @@ describe("качество трансляции", () => {
   });
 
   it("строит capture constraints из ручных resolution и FPS", () => {
-    expect(constraints({ ...DEFAULT_STREAM_SETTINGS, resolution: "2160", fps: 120 })).toEqual({
+    expect(
+      constraints({ ...DEFAULT_STREAM_SETTINGS, resolution: "2160", fps: 120 }),
+    ).toEqual({
       width: { ideal: 3840, max: 3840 },
       height: { ideal: 2160, max: 2160 },
       frameRate: { ideal: 120, max: 120 },
     });
     expect(RESOLUTION_STEPS.map((item) => item.value)).toEqual([
-      "auto", "720", "1080", "1440", "2160",
+      "auto",
+      "720",
+      "1080",
+      "1440",
+      "2160",
     ]);
   });
   it("подсказывает про галочку системного звука для экрана и окна", () => {

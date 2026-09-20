@@ -1,12 +1,19 @@
 import type { RemoteTrack } from "livekit-client";
 
 export type BufferPreference = number | null;
-export type PlayoutSupport = "jitterBufferTarget" | "playoutDelayHint" | "unsupported";
+export type PlayoutSupport =
+  "jitterBufferTarget" | "playoutDelayHint" | "unsupported";
 
 const STORAGE_KEY = "viewer.playoutBuffer";
 
 function isValidBufferPreference(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0.1 && value <= 4 && Math.abs(value * 10 - Math.round(value * 10)) < Number.EPSILON;
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0.1 &&
+    value <= 4 &&
+    Math.abs(value * 10 - Math.round(value * 10)) < Number.EPSILON
+  );
 }
 
 function normalizeBufferPreference(value: unknown): BufferPreference {
@@ -24,7 +31,10 @@ export function loadBufferPreference(storage: Storage): BufferPreference {
   }
 }
 
-export function saveBufferPreference(storage: Storage, value: BufferPreference): void {
+export function saveBufferPreference(
+  storage: Storage,
+  value: BufferPreference,
+): void {
   const normalized = normalizeBufferPreference(value);
   try {
     storage.setItem(STORAGE_KEY, JSON.stringify(normalized));
@@ -33,7 +43,10 @@ export function saveBufferPreference(storage: Storage, value: BufferPreference):
   }
 }
 
-export function applyPlayoutBuffer(track: RemoteTrack, seconds: BufferPreference): PlayoutSupport {
+export function applyPlayoutBuffer(
+  track: RemoteTrack,
+  seconds: BufferPreference,
+): PlayoutSupport {
   seconds = normalizeBufferPreference(seconds);
   const receiver = track.receiver;
   if (!receiver) return "unsupported";
@@ -58,11 +71,15 @@ export function applyPlayoutBuffer(track: RemoteTrack, seconds: BufferPreference
   return "unsupported";
 }
 
-export function applyPlayoutBufferToTracks(tracks: Iterable<RemoteTrack>, value: BufferPreference): PlayoutSupport {
+export function applyPlayoutBufferToTracks(
+  tracks: Iterable<RemoteTrack>,
+  value: BufferPreference,
+): PlayoutSupport {
   let support: PlayoutSupport = "unsupported";
   for (const track of tracks) {
     const result = applyPlayoutBuffer(track, value);
-    if (result !== "unsupported") support = support === "unsupported" ? result : support;
+    if (result !== "unsupported")
+      support = support === "unsupported" ? result : support;
   }
   return support;
 }
