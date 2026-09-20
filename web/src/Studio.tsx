@@ -42,9 +42,18 @@ import {
   type CounterSample,
   type StreamMetrics,
 } from "./stats";
+import {
+  createLatestSettingsUpdater,
+  createStatsSessionGuard,
+  formatCaptureFrameRate,
+} from "./studioRuntime";
 
 type NumericSetting =
   "fps" | "videoBitrateMbps" | "audioBitrateKbps" | "balance";
+type SettingsUpdate = {
+  settings: StreamSettings;
+  tracks: PublishedTracks;
+};
 
 const sameSettings = (left: StreamSettings, right: StreamSettings) =>
   left.resolution === right.resolution &&
@@ -86,9 +95,39 @@ export default function Studio({ id }: { id: string }) {
     previousVideoSample = useRef<CounterSample | undefined>(undefined),
     previousAudioSample = useRef<CounterSample | undefined>(undefined),
     mounted = useRef(true);
+  const statsSessionGuard = useRef(
+    createStatsSessionGuard<object | undefined>(),
+  ).current;
+  const [settingsUpdater] = useState(() =>
+    createLatestSettingsUpdater<SettingsUpdate, string>({
+      apply: ({ settings: next, tracks }) => updateQuality(tracks, next),
+      rollback: ({ settings: confirmed, tracks }) =>
+        updateQuality(tracks, confirmed).then(() => {}),
+      readConfirmed: (failed) => ({
+        ...failed,
+        settings: confirmedSettings.current,
+      }),
+      equals: (left, right) =>
+        left.tracks === right.tracks &&
+        sameSettings(left.settings, right.settings),
+      onBusy: setBusy,
+      onStart: () => setError(""),
+      onSuccess: (update, nextNote) => {
+        if (tracksRef.current !== update.tracks) return;
+        confirmedSettings.current = update.settings;
+        setNote(nextNote);
+      },
+      onFailure: (failure, confirmed, shouldRestoreDraft, failed) => {
+        if (tracksRef.current !== failed.tracks) return;
+        if (shouldRestoreDraft) setSettings(confirmed.settings);
+        setError(`Не удалось изменить качество: ${message(failure)}`);
+      },
+    }),
+  );
   const viewerURL = `${location.origin}/watch/${id}`;
 
   function resetDiagnostics() {
+    statsSessionGuard.invalidate();
     previousVideoSample.current = undefined;
     previousAudioSample.current = undefined;
     setVideoMetrics({});
@@ -132,7 +171,7 @@ export default function Studio({ id }: { id: string }) {
       const videoCapture = stream?.getVideoTracks()[0]?.getSettings();
       if (videoCapture)
         setCaptureVideo(
-          `${videoCapture.width ?? "—"} × ${videoCapture.height ?? "—"} · ${Math.round(videoCapture.frameRate || 0)} FPS`,
+          `${videoCapture.width ?? "—"} × ${videoCapture.height ?? "—"} · ${formatCaptureFrameRate(videoCapture.frameRate)}`,
         );
       const audioCapture = stream?.getAudioTracks()[0]?.getSettings();
       if (audioCapture)
@@ -142,10 +181,16 @@ export default function Studio({ id }: { id: string }) {
 
       const tracks = tracksRef.current;
       if (!tracks) return;
+      const videoRead = statsSessionGuard.capture(tracks.video);
       void tracks.video
         .getRTCStatsReport()
         .then((report) => {
-          if (!report || !mounted.current) return;
+          if (
+            !report ||
+            !mounted.current ||
+            !statsSessionGuard.isCurrent(videoRead, tracksRef.current?.video)
+          )
+            return;
           const parsed = parseOutboundStats(
             Array.from(report.values()),
             previousVideoSample.current,
@@ -154,11 +199,18 @@ export default function Studio({ id }: { id: string }) {
           setVideoMetrics(parsed.metrics);
         })
         .catch(() => {});
-      if (tracks.audio)
-        void tracks.audio
+      if (tracks.audio) {
+        const audio = tracks.audio;
+        const audioRead = statsSessionGuard.capture(audio);
+        void audio
           .getRTCStatsReport()
           .then((report) => {
-            if (!report || !mounted.current) return;
+            if (
+              !report ||
+              !mounted.current ||
+              !statsSessionGuard.isCurrent(audioRead, tracksRef.current?.audio)
+            )
+              return;
             const parsed = parseOutboundStats(
               Array.from(report.values()),
               previousAudioSample.current,
@@ -167,6 +219,7 @@ export default function Studio({ id }: { id: string }) {
             setAudioMetrics(parsed.metrics);
           })
           .catch(() => {});
+      }
     }, 1000);
     return () => clearInterval(timer);
   }, [live]);
@@ -279,29 +332,14 @@ export default function Studio({ id }: { id: string }) {
       setBusy(false);
     }
   }
-  async function commitSettings(next: StreamSettings) {
+  function commitSettings(next: StreamSettings) {
     setSettings(next);
     const tracks = tracksRef.current;
     if (!tracks || !live) {
       confirmedSettings.current = next;
       return;
     }
-    if (sameSettings(next, confirmedSettings.current)) return;
-    setBusy(true);
-    setError("");
-    try {
-      setNote(await updateQuality(tracks, next));
-      confirmedSettings.current = next;
-    } catch (e) {
-      const confirmed = confirmedSettings.current;
-      try {
-        await updateQuality(tracks, confirmed);
-      } catch {}
-      setSettings(confirmed);
-      setError(`Не удалось изменить качество: ${message(e)}`);
-    } finally {
-      setBusy(false);
-    }
+    void settingsUpdater.enqueue({ settings: next, tracks });
   }
 
   const draftNumber = (key: NumericSetting, value: string) => ({
