@@ -29,14 +29,17 @@ export function saveBufferPreferenceSafely(
 
 export type IncomingStatsRead<T, S> = {
   generation: number;
+  sequence: number;
   track: T;
   previous: S | undefined;
 };
 
 export function createIncomingStatsTracker<T, S>() {
   let generation = 0;
+  let sequence = 0;
   let track: T | null = null;
   let sample: S | undefined;
+  let inFlight: IncomingStatsRead<T, S> | undefined;
 
   return {
     current() {
@@ -46,20 +49,29 @@ export function createIncomingStatsTracker<T, S>() {
       if (track === next) return false;
       track = next;
       sample = undefined;
+      inFlight = undefined;
       generation += 1;
       return true;
     },
-    capture(candidate: T): IncomingStatsRead<T, S> {
-      return {
+    capture(candidate: T): IncomingStatsRead<T, S> | undefined {
+      if (inFlight) return undefined;
+      inFlight = {
         generation,
+        sequence: ++sequence,
         track: candidate,
         previous: candidate === track ? sample : undefined,
       };
+      return inFlight;
     },
     commit(read: IncomingStatsRead<T, S>, next: S | undefined) {
+      if (inFlight !== read) return false;
+      inFlight = undefined;
       if (read.generation !== generation || read.track !== track) return false;
       sample = next;
       return true;
+    },
+    release(read: IncomingStatsRead<T, S>) {
+      if (inFlight === read) inFlight = undefined;
     },
   };
 }

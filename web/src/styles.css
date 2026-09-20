@@ -793,6 +793,10 @@ footer a {
   color: #727a87;
   font-size: 9px;
 }
+.quality-balance-scale .active {
+  color: var(--accent);
+  font-weight: 600;
+}
 .diagnostics {
   display: grid;
   grid-template-columns: minmax(0, 1fr);

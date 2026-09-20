@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatLimitation,
   formatMetric,
   parseInboundStats,
   parseOutboundStats,
@@ -196,6 +197,21 @@ describe("stream health", () => {
     expect(streamHealth({ lossPercent: 0.2, rttMs: 250 })).toBe("Стабильно");
     expect(streamHealth({ lossPercent: 0.2, rttMs: 40 })).toBe("Отлично");
     expect(streamHealth({})).toBe("Определяем");
+  });
+
+  it("treats every reported encoder limitation as restrictive", () => {
+    expect(
+      streamHealth({ limitation: "none", lossPercent: 0, rttMs: 20 }),
+    ).toBe("Отлично");
+    expect(
+      streamHealth({ limitation: "other", lossPercent: 0, rttMs: 20 }),
+    ).toBe("Ограничено: другое");
+    expect(
+      streamHealth({ limitation: "encoder", lossPercent: 0, rttMs: 20 }),
+    ).toBe("Ограничено: encoder");
+    expect(formatLimitation("none")).toBe("—");
+    expect(formatLimitation("other")).toBe("Другое");
+    expect(formatLimitation(undefined)).toBe("—");
   });
 });
 

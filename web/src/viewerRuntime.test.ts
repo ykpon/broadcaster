@@ -32,16 +32,21 @@ describe("Viewer incoming stats lifecycle", () => {
     const replacementTrack = {};
 
     expect(tracker.replace(firstTrack)).toBe(true);
-    const firstRead = tracker.capture(firstTrack);
+    const firstRead = tracker.capture(firstTrack)!;
     expect(firstRead.previous).toBeUndefined();
     expect(tracker.commit(firstRead, 10)).toBe(true);
-    expect(tracker.capture(firstTrack).previous).toBe(10);
+    const resumedRead = tracker.capture(firstTrack)!;
+    expect(resumedRead.previous).toBe(10);
+    tracker.release(resumedRead);
 
-    const pendingRead = tracker.capture(firstTrack);
+    const pendingRead = tracker.capture(firstTrack)!;
     expect(tracker.replace(replacementTrack)).toBe(true);
-    expect(tracker.capture(replacementTrack).previous).toBeUndefined();
+    const replacementRead = tracker.capture(replacementTrack)!;
+    expect(replacementRead.previous).toBeUndefined();
     expect(tracker.commit(pendingRead, 99)).toBe(false);
-    expect(tracker.capture(replacementTrack).previous).toBeUndefined();
+    expect(tracker.capture(replacementTrack)).toBeUndefined();
+    expect(tracker.commit(replacementRead, 20)).toBe(true);
+    expect(tracker.capture(replacementTrack)?.previous).toBe(20);
   });
 
   it("rejects a pending report after unsubscribe or reset", () => {
@@ -49,9 +54,34 @@ describe("Viewer incoming stats lifecycle", () => {
     const track = {};
 
     tracker.replace(track);
-    const pendingRead = tracker.capture(track);
+    const pendingRead = tracker.capture(track)!;
     expect(tracker.replace(null)).toBe(true);
     expect(tracker.commit(pendingRead, 12)).toBe(false);
     expect(tracker.current()).toBeNull();
+  });
+
+  it("allows only one in-flight report for the same track", () => {
+    const tracker = createIncomingStatsTracker<object, number>();
+    const track = {};
+
+    tracker.replace(track);
+    const first = tracker.capture(track)!;
+    expect(tracker.capture(track)).toBeUndefined();
+    expect(tracker.commit(first, 10)).toBe(true);
+    expect(tracker.capture(track)).toBeDefined();
+  });
+
+  it("does not let a stale report release a newer same-track report", () => {
+    const tracker = createIncomingStatsTracker<object, number>();
+    const track = {};
+
+    tracker.replace(track);
+    const stale = tracker.capture(track)!;
+    tracker.replace(null);
+    tracker.replace(track);
+    const current = tracker.capture(track)!;
+    expect(tracker.commit(stale, 99)).toBe(false);
+    expect(tracker.capture(track)).toBeUndefined();
+    expect(tracker.commit(current, 10)).toBe(true);
   });
 });

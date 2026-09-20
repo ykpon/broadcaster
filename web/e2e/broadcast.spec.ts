@@ -56,6 +56,8 @@ test("реальный SFU: публикация тестового видео �
   await page.getByLabel("Видеобитрейт").fill("20");
   await page.getByLabel("Аудиобитрейт").fill("192");
   await page.getByLabel("Баланс качества").fill("65");
+  await expect(page.getByText("Баланс", { exact: true })).toBeVisible();
+  await expect(page.getByText("65% · Движение", { exact: true })).toBeVisible();
   await page.getByLabel("Кодек").selectOption("vp8");
   const viewerContext = await browser.newContext();
   const viewer = await viewerContext.newPage();

@@ -175,17 +175,11 @@ export function parseInboundStats(
   return { metrics, sample };
 }
 
-export function streamHealth(
-  metrics: StreamMetrics,
-):
-  | "Ограничено CPU"
-  | "Ограничено сетью"
-  | "Есть потери"
-  | "Стабильно"
-  | "Отлично"
-  | "Определяем" {
+export function streamHealth(metrics: StreamMetrics): string {
   if (metrics.limitation === "cpu") return "Ограничено CPU";
   if (metrics.limitation === "bandwidth") return "Ограничено сетью";
+  if (metrics.limitation && metrics.limitation !== "none")
+    return `Ограничено: ${metrics.limitation === "other" ? "другое" : metrics.limitation}`;
 
   const hasLoss = metrics.lossPercent !== undefined;
   const hasRtt = metrics.rttMs !== undefined;
@@ -205,6 +199,17 @@ export function streamHealth(
   )
     return "Отлично";
   return "Определяем";
+}
+
+const limitationLabels: Record<string, string> = {
+  bandwidth: "Сеть",
+  cpu: "CPU",
+  other: "Другое",
+};
+
+export function formatLimitation(reason: string | undefined): string {
+  if (!reason || reason === "none") return "—";
+  return limitationLabels[reason] ?? reason;
 }
 
 export function formatMetric(value: number | undefined, suffix = ""): string {

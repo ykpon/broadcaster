@@ -23,19 +23,20 @@ import { api, message, type Connection } from "./api";
 import {
   RESOLUTION_STEPS,
   SETTING_RANGES,
-  loadStreamSettings,
-  saveStreamSettings,
   captureError,
   audioHint,
+  qualityBalanceLabel,
   type StreamSettings,
 } from "./quality";
 import {
   applyQuality,
   publishScreen,
   updateQuality,
+  type QualityUpdateResult,
   type PublishedTracks,
 } from "./media";
 import {
+  formatLimitation,
   formatMetric,
   parseOutboundStats,
   streamHealth,
@@ -46,15 +47,12 @@ import {
   createLatestSettingsUpdater,
   createStatsSessionGuard,
   formatCaptureFrameRate,
+  loadStreamSettingsSafely,
+  saveStreamSettingsSafely,
 } from "./studioRuntime";
 
 type NumericSetting =
   "fps" | "videoBitrateMbps" | "audioBitrateKbps" | "balance";
-type SettingsUpdate = {
-  settings: StreamSettings;
-  tracks: PublishedTracks;
-};
-
 const sameSettings = (left: StreamSettings, right: StreamSettings) =>
   left.resolution === right.resolution &&
   left.fps === right.fps &&
@@ -69,10 +67,11 @@ export default function Studio({ id }: { id: string }) {
     () => new URLSearchParams(location.hash.slice(1)).get("key") || "",
   );
   const [settings, setSettings] = useState<StreamSettings>(() =>
-      loadStreamSettings(localStorage),
+      loadStreamSettingsSafely(() => window.localStorage),
     ),
     [appliedSettings, setAppliedSettings] = useState(settings),
     [busy, setBusy] = useState(false),
+    [qualityBusy, setQualityBusy] = useState(false),
     [live, setLive] = useState(false),
     [ended, setEnded] = useState(false),
     [error, setError] = useState(""),
@@ -100,43 +99,53 @@ export default function Studio({ id }: { id: string }) {
     createStatsSessionGuard<object | undefined>(),
   ).current;
   const [settingsUpdater] = useState(() =>
-    createLatestSettingsUpdater<SettingsUpdate, string>({
-      apply: ({ settings: next, tracks }) => updateQuality(tracks, next),
-      rollback: ({ settings: confirmed, tracks }) =>
-        updateQuality(tracks, confirmed).then(() => {}),
-      readConfirmed: (failed) => ({
-        ...failed,
-        settings: confirmedSettings.current,
-      }),
-      equals: (left, right) =>
-        left.tracks === right.tracks &&
-        sameSettings(left.settings, right.settings),
-      onBusy: setBusy,
+    createLatestSettingsUpdater<StreamSettings, QualityUpdateResult>({
+      apply: (next) => {
+        const room = roomRef.current;
+        const tracks = tracksRef.current;
+        if (!room || !tracks) return Promise.reject(new Error("Эфир завершён"));
+        return updateQuality(room, tracks, confirmedSettings.current, next);
+      },
+      rollback: (confirmed, failed) => {
+        const room = roomRef.current;
+        const tracks = tracksRef.current;
+        if (!room || !tracks) return Promise.resolve();
+        return updateQuality(room, tracks, failed, confirmed);
+      },
+      readConfirmed: () => confirmedSettings.current,
+      equals: sameSettings,
+      onBusy: setQualityBusy,
       onStart: () => setError(""),
-      onApplied: (update) => {
-        if (tracksRef.current !== update.tracks) return;
-        confirmedSettings.current = update.settings;
-        setAppliedSettings(update.settings);
+      onApplied: (next, result) => {
+        tracksRef.current = result.tracks;
+        if (result.videoRepublished) resetStats();
+        confirmedSettings.current = next;
+        setAppliedSettings(next);
       },
-      onSuccess: (update, nextNote) => {
-        if (tracksRef.current !== update.tracks) return;
-        setNote(nextNote);
+      onRolledBack: (_confirmed, result) => {
+        if (!result) return;
+        tracksRef.current = result.tracks;
+        if (result.videoRepublished) resetStats();
       },
-      onFailure: (failure, confirmed, shouldRestoreDraft, failed) => {
-        if (tracksRef.current !== failed.tracks) return;
-        if (shouldRestoreDraft) setSettings(confirmed.settings);
+      onSuccess: (_next, result) => setNote(result.note),
+      onFailure: (failure, confirmed, shouldRestoreDraft) => {
+        if (shouldRestoreDraft) setSettings(confirmed);
         setError(`Не удалось изменить качество: ${message(failure)}`);
       },
     }),
   );
   const viewerURL = `${location.origin}/watch/${id}`;
 
-  function resetDiagnostics() {
+  function resetStats() {
     statsSessionGuard.invalidate();
     previousVideoSample.current = undefined;
     previousAudioSample.current = undefined;
     setVideoMetrics({});
     setAudioMetrics({});
+  }
+
+  function resetDiagnostics() {
+    resetStats();
     setCaptureVideo("");
     setCaptureAudio("");
   }
@@ -145,6 +154,7 @@ export default function Studio({ id }: { id: string }) {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      settingsUpdater.cancel();
       streamRef.current?.getTracks().forEach((t) => {
         t.onended = null;
         t.stop();
@@ -153,10 +163,11 @@ export default function Studio({ id }: { id: string }) {
     };
   }, []);
   useEffect(() => {
-    saveStreamSettings(localStorage, settings);
+    saveStreamSettingsSafely(() => window.localStorage, settings);
   }, [settings]);
   useEffect(() => {
     if (info?.state === "ended") {
+      settingsUpdater.cancel();
       setEnded(true);
       setLive(false);
       tracksRef.current = null;
@@ -187,43 +198,47 @@ export default function Studio({ id }: { id: string }) {
       const tracks = tracksRef.current;
       if (!tracks) return;
       const videoRead = statsSessionGuard.capture(tracks.video);
-      void tracks.video
-        .getRTCStatsReport()
-        .then((report) => {
-          if (
-            !report ||
-            !mounted.current ||
-            !statsSessionGuard.isCurrent(videoRead, tracksRef.current?.video)
-          )
-            return;
-          const parsed = parseOutboundStats(
-            Array.from(report.values()),
-            previousVideoSample.current,
-          );
-          previousVideoSample.current = parsed.sample;
-          setVideoMetrics(parsed.metrics);
-        })
-        .catch(() => {});
-      if (tracks.audio) {
-        const audio = tracks.audio;
-        const audioRead = statsSessionGuard.capture(audio);
-        void audio
+      if (videoRead)
+        void tracks.video
           .getRTCStatsReport()
           .then((report) => {
-            if (
-              !report ||
-              !mounted.current ||
-              !statsSessionGuard.isCurrent(audioRead, tracksRef.current?.audio)
-            )
+            if (!report || !mounted.current) {
+              statsSessionGuard.release(videoRead);
+              return;
+            }
+            if (!statsSessionGuard.commit(videoRead, tracksRef.current?.video))
               return;
             const parsed = parseOutboundStats(
               Array.from(report.values()),
-              previousAudioSample.current,
+              previousVideoSample.current,
             );
-            previousAudioSample.current = parsed.sample;
-            setAudioMetrics(parsed.metrics);
+            previousVideoSample.current = parsed.sample;
+            setVideoMetrics(parsed.metrics);
           })
-          .catch(() => {});
+          .catch(() => statsSessionGuard.release(videoRead));
+      if (tracks.audio) {
+        const audio = tracks.audio;
+        const audioRead = statsSessionGuard.capture(audio);
+        if (audioRead)
+          void audio
+            .getRTCStatsReport()
+            .then((report) => {
+              if (!report || !mounted.current) {
+                statsSessionGuard.release(audioRead);
+                return;
+              }
+              if (
+                !statsSessionGuard.commit(audioRead, tracksRef.current?.audio)
+              )
+                return;
+              const parsed = parseOutboundStats(
+                Array.from(report.values()),
+                previousAudioSample.current,
+              );
+              previousAudioSample.current = parsed.sample;
+              setAudioMetrics(parsed.metrics);
+            })
+            .catch(() => statsSessionGuard.release(audioRead));
       }
     }, 1000);
     return () => clearInterval(timer);
@@ -231,6 +246,7 @@ export default function Studio({ id }: { id: string }) {
   async function finish() {
     if (ending.current) return;
     ending.current = true;
+    settingsUpdater.cancel();
     setBusy(true);
     setLive(false);
     tracksRef.current = null;
@@ -251,6 +267,7 @@ export default function Studio({ id }: { id: string }) {
     }
   }
   async function start() {
+    settingsUpdater.cancel();
     setError("");
     setNote("");
     setBusy(true);
@@ -293,7 +310,8 @@ export default function Studio({ id }: { id: string }) {
       roomRef.current = room;
       room.on(RoomEvent.ConnectionStateChanged, setState);
       room.on(RoomEvent.Disconnected, () => {
-        if (!ending.current && mounted.current) {
+        if (!ending.current && mounted.current && roomRef.current === room) {
+          settingsUpdater.cancel();
           streamRef.current?.getTracks().forEach((t) => {
             t.onended = null;
             t.stop();
@@ -329,6 +347,7 @@ export default function Studio({ id }: { id: string }) {
         void preview.current.play().catch(() => {});
       }
     } catch (e) {
+      settingsUpdater.cancel();
       tracksRef.current = null;
       resetDiagnostics();
       stream?.getTracks().forEach((t) => t.stop());
@@ -345,7 +364,7 @@ export default function Studio({ id }: { id: string }) {
       confirmedSettings.current = next;
       return;
     }
-    void settingsUpdater.enqueue({ settings: next, tracks });
+    void settingsUpdater.enqueue(next);
   }
 
   const draftNumber = (key: NumericSetting, value: string) => ({
@@ -366,6 +385,7 @@ export default function Studio({ id }: { id: string }) {
     videoMetrics.width !== undefined || videoMetrics.height !== undefined
       ? `${formatMetric(videoMetrics.width)} × ${formatMetric(videoMetrics.height)} · ${formatMetric(videoMetrics.fps, " FPS")}`
       : "—";
+  const balanceLabel = qualityBalanceLabel(settings.balance);
   const isEnded = ended || info?.state === "ended";
   return (
     <div className="app">
@@ -484,7 +504,7 @@ export default function Studio({ id }: { id: string }) {
             </div>
           </div>
           <aside className="studio-sidebar">
-            <section className="panel">
+            <section className="panel" aria-busy={qualityBusy}>
               <div className="panel-title">
                 <Settings2 size={18} />
                 <h2>Настройки эфира</h2>
@@ -650,7 +670,9 @@ export default function Studio({ id }: { id: string }) {
               <div className="range-control">
                 <div className="range-heading">
                   <label htmlFor="balance">Баланс качества</label>
-                  <span className="range-value">{settings.balance}%</span>
+                  <span className="range-value">
+                    {settings.balance}% · {balanceLabel}
+                  </span>
                 </div>
                 <input
                   id="balance"
@@ -673,9 +695,17 @@ export default function Studio({ id }: { id: string }) {
                     void commitNumber("balance", event.currentTarget.value)
                   }
                 />
-                <div className="range-scale">
-                  <span>Чёткость</span>
-                  <span>Движение</span>
+                <div className="range-scale quality-balance-scale">
+                  {(["Чёткость", "Баланс", "Движение"] as const).map(
+                    (label) => (
+                      <span
+                        key={label}
+                        className={balanceLabel === label ? "active" : ""}
+                      >
+                        {label}
+                      </span>
+                    ),
+                  )}
                 </div>
               </div>
               <label htmlFor="codec">Кодек</label>
@@ -736,6 +766,10 @@ export default function Studio({ id }: { id: string }) {
                   <h3>Видео</h3>
                   <span className="metric-row">
                     Состояние <strong>{streamHealth(videoMetrics)}</strong>
+                  </span>
+                  <span className="metric-row">
+                    Ограничение
+                    <strong>{formatLimitation(videoMetrics.limitation)}</strong>
                   </span>
                   <span className="metric-row">
                     Кодек <strong>{videoMetrics.codec ?? "—"}</strong>

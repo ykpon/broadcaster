@@ -5,13 +5,11 @@ import {
   constraints,
   captureError,
   audioHint,
-  kbps,
   loadStreamSettings,
   normalizeStreamSettings,
+  qualityBalanceLabel,
   qualityHints,
   saveStreamSettings,
-  soundLabel,
-  limitLabel,
   type StreamSettings,
 } from "./quality";
 
@@ -79,6 +77,12 @@ describe("качество трансляции", () => {
       contentHint: "motion",
       degradationPreference: "maintain-framerate",
     });
+    expect([39, 40, 60, 61].map(qualityBalanceLabel)).toEqual([
+      "Чёткость",
+      "Баланс",
+      "Баланс",
+      "Движение",
+    ]);
   });
 
   it("строит capture constraints из ручных resolution и FPS", () => {
@@ -106,35 +110,5 @@ describe("качество трансляции", () => {
     expect(
       captureError(new DOMException("denied", "NotAllowedError")),
     ).toContain("отменён");
-  });
-});
-
-describe("показания звука", () => {
-  it("считает килобиты в секунду по приросту байт", () => {
-    // 16000 байт за секунду = 128 кбит/с — ровно то, что просим у Opus.
-    expect(kbps(16000, 1000, { bytes: 0, at: 0 })).toBe(0);
-    expect(kbps(32000, 2000, { bytes: 16000, at: 1000 })).toBe(128);
-  });
-
-  it("называет частоту и каналы захвата", () => {
-    expect(soundLabel({ sampleRate: 48000, channelCount: 2 }, 128)).toBe(
-      "48 кГц · стерео · 128 кбит/с · потери 0.0%",
-    );
-    expect(soundLabel({ sampleRate: 16000, channelCount: 1 }, 24, 0.031)).toBe(
-      "16 кГц · моно · 24 кбит/с · потери 3.1%",
-    );
-    expect(soundLabel(undefined, 0)).toBe("— · — · 0 кбит/с · потери 0.0%");
-  });
-});
-
-describe("limitLabel", () => {
-  it("называет причину, когда энкодер зажат", () => {
-    expect(limitLabel("bandwidth")).toBe(" · упирается в сеть");
-    expect(limitLabel("cpu")).toBe(" · упирается в CPU");
-  });
-
-  it("молчит, когда ограничения нет", () => {
-    expect(limitLabel("none")).toBe("");
-    expect(limitLabel(undefined)).toBe("");
   });
 });

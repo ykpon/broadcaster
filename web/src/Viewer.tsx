@@ -159,10 +159,14 @@ export default function Viewer({ id }: { id: string }) {
       const track = tracker.current();
       if (!track) return;
       const read = tracker.capture(track);
+      if (!read) return;
       void track
         .getRTCStatsReport()
         .then((report) => {
-          if (!report || !mounted.current) return;
+          if (!report || !mounted.current) {
+            tracker.release(read);
+            return;
+          }
           const parsed = parseInboundStats(
             Array.from(report.values()),
             read.previous,
@@ -170,7 +174,7 @@ export default function Viewer({ id }: { id: string }) {
           if (!tracker.commit(read, parsed.sample)) return;
           setMetrics(parsed.metrics);
         })
-        .catch(() => {});
+        .catch(() => tracker.release(read));
     };
     const timer = setInterval(() => {
       poll(videoStats.current, setVideoMetrics);

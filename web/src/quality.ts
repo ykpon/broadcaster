@@ -106,6 +106,12 @@ export function qualityHints(balance: number): {
   return { contentHint: "motion", degradationPreference: "maintain-framerate" };
 }
 
+export function qualityBalanceLabel(balance: number) {
+  if (balance < 40) return "Чёткость";
+  if (balance <= 60) return "Баланс";
+  return "Движение";
+}
+
 export function constraints(settings: StreamSettings): MediaTrackConstraints {
   const size = RESOLUTION_STEPS.find(
     (item) => item.value === settings.resolution,
@@ -136,44 +142,4 @@ export function audioHint(surface: string) {
   if (surface === "browser")
     return "Вкладка молчала при выборе — звук пойдёт, как только в ней заиграет.";
   return "Нет звука: в диалоге выбора включите «Также передать аудио системы». Для всего экрана это работает в Chrome на Windows; на macOS выберите вкладку браузера.";
-}
-
-// Stats timestamps are milliseconds, so bits over milliseconds is already kbit/s.
-export function kbps(
-  bytes: number,
-  at: number,
-  prev: { bytes: number; at: number },
-) {
-  return prev.at && at > prev.at
-    ? ((bytes - prev.bytes) * 8) / (at - prev.at)
-    : 0;
-}
-// The host cannot hear what viewers hear, so name the two things that decide it:
-// a speech-processed capture arrives at 16 kHz mono, and a squeezed uplink shows
-// up as a bitrate far below the 128 kbit/s we ask Opus for.
-export function soundLabel(
-  settings: MediaTrackSettings | undefined,
-  rate: number,
-  loss = 0,
-) {
-  const hz = settings?.sampleRate ? `${settings.sampleRate / 1000} кГц` : "—",
-    channels =
-      settings?.channelCount === 2
-        ? "стерео"
-        : settings?.channelCount
-          ? "моно"
-          : "—";
-  return `${hz} · ${channels} · ${Math.round(rate)} кбит/с · потери ${(loss * 100).toFixed(1)}%`;
-}
-// Opus rebuilds lost packets from a band-limited FEC copy, so steady loss is heard as
-// dull audio long before it is heard as dropouts. The encoder reports why it is holding
-// back, which separates a saturated uplink from a CPU that cannot keep up with 4K.
-const limits: Record<string, string> = {
-  bandwidth: "сеть",
-  cpu: "CPU",
-  other: "другое",
-};
-export function limitLabel(reason?: string) {
-  const name = limits[reason ?? ""];
-  return name ? ` · упирается в ${name}` : "";
 }
