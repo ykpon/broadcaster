@@ -130,6 +130,31 @@ func TestServerStartIsTransactional(t *testing.T) {
 	}
 }
 
+func TestActiveStartDoesNotReplaceGenerationOrMedia(t *testing.T) {
+	for _, initial := range []Transport{TransportServer, TransportP2P} {
+		t.Run(string(initial), func(t *testing.T) {
+			s, media, id, secret := createTest(t)
+			path := "/api/rooms/" + id
+			if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"`+string(initial)+`","viewerLimit":"10"}`); code != 200 {
+				t.Fatal(code)
+			}
+			room := s.rooms[id]
+			generation, transport, limit, mediaRoom := room.Generation, room.Transport, room.ViewerLimit.String(), room.MediaRoom
+			created, deleted := len(media.created), len(media.deleted)
+			restartTransport := TransportP2P
+			if initial == TransportP2P {
+				restartTransport = TransportServer
+			}
+			if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"`+string(restartTransport)+`","viewerLimit":"999"}`); code != 409 {
+				t.Fatal(code)
+			}
+			if room.Generation != generation || room.Transport != transport || room.ViewerLimit.String() != limit || room.MediaRoom != mediaRoom || len(media.created) != created || len(media.deleted) != deleted {
+				t.Fatalf("active start changed room=%+v created=%v deleted=%v", room, media.created, media.deleted)
+			}
+		})
+	}
+}
+
 func TestStopRejectsStaleGeneration(t *testing.T) {
 	s, _, id, secret := createTest(t)
 	path := "/api/rooms/" + id
@@ -141,6 +166,33 @@ func TestStopRejectsStaleGeneration(t *testing.T) {
 	}
 	if code, _ := call(t, s.Handler(), "POST", path+"/stop", `{"hostSecret":"`+secret+`","generation":1}`); code != 200 {
 		t.Fatal(code)
+	}
+}
+
+func TestStopResetsEmptySinceForOneHourExpiry(t *testing.T) {
+	for _, transport := range []Transport{TransportServer, TransportP2P} {
+		t.Run(string(transport), func(t *testing.T) {
+			s, _, id, secret := createTest(t)
+			path := "/api/rooms/" + id
+			if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"`+string(transport)+`","viewerLimit":"10"}`); code != 200 {
+				t.Fatal(code)
+			}
+			room := s.rooms[id]
+			stale := time.Now().Add(-2 * time.Hour)
+			room.EmptySince = stale
+			if code, _ := call(t, s.Handler(), "POST", path+"/stop", `{"hostSecret":"`+secret+`","generation":1}`); code != 200 {
+				t.Fatal(code)
+			}
+			if !room.EmptySince.After(stale) {
+				t.Fatalf("stop retained stale empty time %v", room.EmptySince)
+			}
+			if err := s.syncRoom(context.Background(), room, room.EmptySince.Add(59*time.Minute)); err != nil || room.State == "ended" {
+				t.Fatal(err, room.State)
+			}
+			if err := s.syncRoom(context.Background(), room, room.EmptySince.Add(time.Hour+time.Second)); err != nil || room.State != "ended" {
+				t.Fatal(err, room.State)
+			}
+		})
 	}
 }
 

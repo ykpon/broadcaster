@@ -222,6 +222,10 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		s.mu.Unlock()
 		return StartResponse{}, 410, "Эфир завершён"
 	}
+	if room.Active {
+		s.mu.Unlock()
+		return StartResponse{}, 409, "Эфир уже запущен"
+	}
 	if !anonymous {
 		hash := sha256.Sum256([]byte(secret))
 		if subtle.ConstantTimeCompare(hash[:], room.Secret[:]) != 1 {
@@ -250,7 +254,7 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 
 	s.mu.Lock()
 	room = s.rooms[id]
-	if room == nil || room.State == "ended" || room.Generation != generation || len(room.Seats) != occupied || !limit.Allows(len(room.Seats)) {
+	if room == nil || room.State == "ended" || room.Active || room.Generation != generation || len(room.Seats) != occupied || !limit.Allows(len(room.Seats)) {
 		s.mu.Unlock()
 		if mediaRoom != "" {
 			if err := s.media.Delete(ctx, mediaRoom); err != nil {
@@ -344,6 +348,7 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	mediaRoom := room.MediaRoom
 	room.Active = false
 	room.State = "waiting"
+	room.EmptySince = time.Now()
 	s.mu.Unlock()
 	if mediaRoom != "" {
 		if err := s.media.Delete(r.Context(), mediaRoom); err != nil {
@@ -464,8 +469,13 @@ func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error 
 	}
 	if room.Transport != TransportServer || room.MediaRoom == "" {
 		s.expireSeats(room, now)
-		if !room.Active && !room.EmptySince.IsZero() && now.Sub(room.EmptySince) > time.Hour {
-			s.markEnded(room, now)
+		if !room.Active {
+			if room.EmptySince.IsZero() {
+				room.EmptySince = now
+			}
+			if now.Sub(room.EmptySince) > time.Hour {
+				s.markEnded(room, now)
+			}
 		}
 		return nil
 	}
