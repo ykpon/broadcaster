@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,11 +16,19 @@ import (
 
 type fakeMedia struct {
 	participants []Participant
-	deleted      bool
+	created      []string
+	deleted      []string
+	createErr    error
 }
 
-func (f *fakeMedia) Create(context.Context, string) error { return nil }
-func (f *fakeMedia) Delete(context.Context, string) error { f.deleted = true; return nil }
+func (f *fakeMedia) Create(_ context.Context, room string) error {
+	f.created = append(f.created, room)
+	return f.createErr
+}
+func (f *fakeMedia) Delete(_ context.Context, room string) error {
+	f.deleted = append(f.deleted, room)
+	return nil
+}
 func (f *fakeMedia) Participants(context.Context, string) ([]Participant, error) {
 	return f.participants, nil
 }
@@ -58,10 +67,10 @@ func TestRoomPermissionsAndEnd(t *testing.T) {
 		t.Fatal(c)
 	}
 	_, info := call(t, h, "GET", path, "")
-	if len(info) != 3 {
+	if len(info) != 6 || info["generation"] != float64(1) || info["transport"] != "server" || info["viewerLimit"] != "10" {
 		t.Fatal("public endpoint leaked fields", info)
 	}
-	if c, _ := call(t, h, "POST", path+"/end", `{"hostSecret":"`+secret+`"}`); c != 200 || !m.deleted {
+	if c, _ := call(t, h, "POST", path+"/end", `{"hostSecret":"`+secret+`"}`); c != 200 || len(m.deleted) != 1 {
 		t.Fatal(c)
 	}
 	if c, _ := call(t, h, "POST", path+"/viewer-token", `{}`); c != 410 {
@@ -71,6 +80,117 @@ func TestRoomPermissionsAndEnd(t *testing.T) {
 		t.Fatal(c)
 	}
 }
+
+func TestCreateRoomDoesNotRequireLiveKitAndDefaultsToTen(t *testing.T) {
+	s, media, id, _ := createTest(t)
+	if media.created != nil {
+		t.Fatalf("created LiveKit eagerly: %v", media.created)
+	}
+	_, info := call(t, s.Handler(), "GET", "/api/rooms/"+id, "")
+	if info["viewerLimit"] != "10" || info["generation"] != float64(0) {
+		t.Fatal(info)
+	}
+}
+
+func TestP2PStartNeverCallsLiveKit(t *testing.T) {
+	s, media, id, secret := createTest(t)
+	code, body := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/start",
+		`{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"999999999999999999999"}`)
+	if code != 200 || body["generation"] != float64(1) || len(media.created) != 0 {
+		t.Fatal(code, body, media.created)
+	}
+}
+
+func TestP2PStartIncludesConfiguredSTUNURL(t *testing.T) {
+	s, _, id, secret := createTest(t)
+	s.STUNURL = "stun:ice.example:3478"
+	code, body := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/start",
+		`{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"10"}`)
+	iceServers, ok := body["iceServers"].([]any)
+	matchesSTUNURL := false
+	if ok && len(iceServers) == 1 {
+		if server, ok := iceServers[0].(map[string]any); ok {
+			if urls, ok := server["urls"].([]any); ok && len(urls) == 1 {
+				matchesSTUNURL = urls[0] == s.STUNURL
+			}
+		}
+	}
+	if code != 200 || !matchesSTUNURL {
+		t.Fatal(code, body)
+	}
+}
+
+func TestServerStartIsTransactional(t *testing.T) {
+	s, media, id, secret := createTest(t)
+	media.createErr = errors.New("offline")
+	code, _ := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/start",
+		`{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`)
+	if code != 503 || s.rooms[id].Generation != 0 || s.rooms[id].Transport != "" {
+		t.Fatal(code, s.rooms[id])
+	}
+}
+
+func TestStopRejectsStaleGeneration(t *testing.T) {
+	s, _, id, secret := createTest(t)
+	path := "/api/rooms/" + id
+	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"10"}`); code != 200 {
+		t.Fatal(code)
+	}
+	if code, _ := call(t, s.Handler(), "POST", path+"/stop", `{"hostSecret":"`+secret+`","generation":0}`); code != 409 {
+		t.Fatal(code)
+	}
+	if code, _ := call(t, s.Handler(), "POST", path+"/stop", `{"hostSecret":"`+secret+`","generation":1}`); code != 200 {
+		t.Fatal(code)
+	}
+}
+
+func TestServerStartUsesGenerationInMediaRoomName(t *testing.T) {
+	s, media, id, secret := createTest(t)
+	path := "/api/rooms/" + id
+	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 200 {
+		t.Fatal(code)
+	}
+	if want := "broadcast-" + id + "-1"; len(media.created) != 1 || media.created[0] != want {
+		t.Fatalf("created = %v, want %q", media.created, want)
+	}
+}
+
+func TestStartRejectsLimitBelowReservedSessions(t *testing.T) {
+	s, _, id, secret := createTest(t)
+	path := "/api/rooms/" + id
+	for range 2 {
+		if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
+			t.Fatal(code)
+		}
+	}
+	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"1"}`); code != 409 {
+		t.Fatal(code)
+	}
+}
+
+func TestLegacyTokenEndpointsLazilyPrepareServerGenerationOne(t *testing.T) {
+	s, media, id, secret := createTest(t)
+	path := "/api/rooms/" + id
+	if code, _ := call(t, s.Handler(), "POST", path+"/host-token", `{"hostSecret":"`+secret+`"}`); code != 200 {
+		t.Fatal(code)
+	}
+	room := s.rooms[id]
+	if room.Generation != 1 || room.Transport != TransportServer || room.ViewerLimit.String() != "10" || len(media.created) != 1 {
+		t.Fatal(room, media.created)
+	}
+	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 || len(media.created) != 1 {
+		t.Fatal(code, media.created)
+	}
+}
+
+func TestEndDeletesOnlyExistingMediaRoom(t *testing.T) {
+	s, media, id, secret := createTest(t)
+	path := "/api/rooms/" + id
+	if code, _ := call(t, s.Handler(), "POST", path+"/end", `{"hostSecret":"`+secret+`"}`); code != 200 || len(media.deleted) != 0 {
+		t.Fatal(code, media.deleted)
+	}
+}
+
 func TestTenViewerReservationsAndReconnect(t *testing.T) {
 	s, _, id, _ := createTest(t)
 	h := s.Handler()
@@ -121,7 +241,10 @@ func TestJWTSignatureAndLeastPrivilege(t *testing.T) {
 	}
 }
 func TestEmptyRoomExpiresAfterOneHour(t *testing.T) {
-	s, m, id, _ := createTest(t)
+	s, m, id, secret := createTest(t)
+	if code, _ := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 200 {
+		t.Fatal(code)
+	}
 	room := s.rooms[id]
 	now := room.Created
 	_ = s.syncRoom(context.Background(), room, now.Add(59*time.Minute))
@@ -133,7 +256,10 @@ func TestEmptyRoomExpiresAfterOneHour(t *testing.T) {
 		t.Fatal("empty room survived longer than one hour")
 	}
 
-	s, m, id, _ = createTest(t)
+	s, m, id, secret = createTest(t)
+	if code, _ := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 200 {
+		t.Fatal(code)
+	}
 	room = s.rooms[id]
 	now = room.Created
 	m.participants = []Participant{{Identity: "host"}}
@@ -154,7 +280,10 @@ func TestEmptyRoomExpiresAfterOneHour(t *testing.T) {
 }
 
 func TestAnyParticipantKeepsRoomAlive(t *testing.T) {
-	s, m, id, _ := createTest(t)
+	s, m, id, secret := createTest(t)
+	if code, _ := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 200 {
+		t.Fatal(code)
+	}
 	room := s.rooms[id]
 	now := room.Created
 	m.participants = []Participant{{Identity: "viewer-present"}}
@@ -190,7 +319,7 @@ func TestLiveKitRPC(t *testing.T) {
 		if strings.HasSuffix(r.URL.Path, "CreateRoom") {
 			var b map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&b)
-			if b["max_participants"] != float64(11) || b["empty_timeout"] != float64(7200) {
+			if b["max_participants"] != float64(0) || b["empty_timeout"] != float64(7200) {
 				t.Error(b)
 			}
 		}
