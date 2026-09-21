@@ -124,6 +124,21 @@ export function createLatestSettingsUpdater<T, R>(
         options.onBusy(false);
       }
     },
+    async settleAndCancel() {
+      const settledGeneration = generation;
+      pending = undefined;
+      const active =
+        running?.generation === settledGeneration ? running.promise : undefined;
+      if (active) await active;
+      if (generation !== settledGeneration) return;
+      generation += 1;
+      pending = undefined;
+      if (running?.generation === settledGeneration) running = undefined;
+      if (busyGeneration === settledGeneration) {
+        busyGeneration = undefined;
+        options.onBusy(false);
+      }
+    },
   };
 }
 

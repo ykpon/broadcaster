@@ -906,6 +906,16 @@ footer a {
 .danger:hover {
   background: #432a26;
 }
+.room-actions {
+  display: grid;
+  gap: 9px;
+}
+.room-actions .button {
+  width: 100%;
+}
+.close-room {
+  color: #9da8b7;
+}
 .sidebar-footnote {
   text-align: center;
   font-size: 9px;

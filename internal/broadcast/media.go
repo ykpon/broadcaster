@@ -79,7 +79,7 @@ func (l *LiveKit) rpc(ctx context.Context, method, room string, body, output any
 	return nil
 }
 func (l *LiveKit) Create(ctx context.Context, name string) error {
-	return l.rpc(ctx, "CreateRoom", name, map[string]any{"name": name, "max_participants": 11, "empty_timeout": 1800, "departure_timeout": 60}, nil)
+	return l.rpc(ctx, "CreateRoom", name, map[string]any{"name": name, "max_participants": 11, "empty_timeout": 7200, "departure_timeout": 60}, nil)
 }
 func (l *LiveKit) Delete(ctx context.Context, name string) error {
 	return l.rpc(ctx, "DeleteRoom", name, map[string]string{"room": name}, nil)

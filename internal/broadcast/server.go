@@ -20,15 +20,14 @@ import (
 )
 
 type Room struct {
-	ID                       string               `json:"roomId"`
-	State                    string               `json:"state"`
-	Viewers                  int                  `json:"viewers"`
-	Secret                   [32]byte             `json:"-"`
-	Name                     string               `json:"-"`
-	Created, LastHost, Ended time.Time            `json:"-"`
-	HostSeen                 bool                 `json:"-"`
-	Deleted                  bool                 `json:"-"`
-	Seats                    map[string]time.Time `json:"-"`
+	ID                         string               `json:"roomId"`
+	State                      string               `json:"state"`
+	Viewers                    int                  `json:"viewers"`
+	Secret                     [32]byte             `json:"-"`
+	Name                       string               `json:"-"`
+	Created, EmptySince, Ended time.Time            `json:"-"`
+	Deleted                    bool                 `json:"-"`
+	Seats                      map[string]time.Time `json:"-"`
 }
 type bucket struct {
 	Start time.Time
@@ -131,7 +130,8 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, secret := randomID(), randomID()
-	room := &Room{ID: id, State: "waiting", Secret: sha256.Sum256([]byte(secret)), Name: "broadcast-" + id, Created: time.Now(), Seats: make(map[string]time.Time)}
+	now := time.Now()
+	room := &Room{ID: id, State: "waiting", Secret: sha256.Sum256([]byte(secret)), Name: "broadcast-" + id, Created: now, EmptySince: now, Seats: make(map[string]time.Time)}
 	if err := s.media.Create(r.Context(), room.Name); err != nil {
 		log.Print(err)
 		problem(w, 503, "Медиасервер недоступен. Попробуйте ещё раз.")
@@ -257,8 +257,6 @@ func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error 
 	for _, p := range participants {
 		if p.Identity == "host" {
 			host = true
-			room.HostSeen = true
-			room.LastHost = now
 			for _, t := range p.Tracks {
 				if t.Source == "SCREEN_SHARE" {
 					video = true
@@ -279,7 +277,12 @@ func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error 
 	} else {
 		room.State = "waiting"
 	}
-	if (!host && room.HostSeen && now.Sub(room.LastHost) > 45*time.Second) || (!room.HostSeen && now.Sub(room.Created) > 30*time.Minute) {
+	if len(participants) > 0 {
+		room.EmptySince = time.Time{}
+	} else if room.EmptySince.IsZero() {
+		room.EmptySince = now
+	}
+	if !room.EmptySince.IsZero() && now.Sub(room.EmptySince) > time.Hour {
 		s.markEnded(room, now)
 	}
 	return nil

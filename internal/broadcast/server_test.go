@@ -120,26 +120,47 @@ func TestJWTSignatureAndLeastPrivilege(t *testing.T) {
 		}
 	}
 }
-func TestLifecycleGraceAndWaitingExpiry(t *testing.T) {
+func TestEmptyRoomExpiresAfterOneHour(t *testing.T) {
 	s, m, id, _ := createTest(t)
 	room := s.rooms[id]
-	now := time.Now()
-	m.participants = []Participant{{Identity: "host"}}
-	_ = s.syncRoom(context.Background(), room, now)
-	m.participants = nil
-	_ = s.syncRoom(context.Background(), room, now.Add(40*time.Second))
+	now := room.Created
+	_ = s.syncRoom(context.Background(), room, now.Add(59*time.Minute))
 	if room.State == "ended" {
-		t.Fatal("ended before grace")
+		t.Fatal("empty room ended before one hour")
 	}
-	_ = s.syncRoom(context.Background(), room, now.Add(46*time.Second))
+	_ = s.syncRoom(context.Background(), room, now.Add(time.Hour+time.Second))
 	if room.State != "ended" {
-		t.Fatal(room.State)
+		t.Fatal("empty room survived longer than one hour")
 	}
-	s, _, id, _ = createTest(t)
+
+	s, m, id, _ = createTest(t)
 	room = s.rooms[id]
-	_ = s.syncRoom(context.Background(), room, time.Now().Add(31*time.Minute))
+	now = room.Created
+	m.participants = []Participant{{Identity: "host"}}
+	_ = s.syncRoom(context.Background(), room, now.Add(time.Minute))
+	m.participants = nil
+	_ = s.syncRoom(context.Background(), room, now.Add(time.Minute+46*time.Second))
+	if room.State == "ended" {
+		t.Fatal("host departure ended a reusable room")
+	}
+	_ = s.syncRoom(context.Background(), room, now.Add(61*time.Minute+45*time.Second))
+	if room.State == "ended" {
+		t.Fatal("room ended before being empty for one hour")
+	}
+	_ = s.syncRoom(context.Background(), room, now.Add(61*time.Minute+47*time.Second))
 	if room.State != "ended" {
-		t.Fatal("unclaimed room leaked")
+		t.Fatal("room did not expire after one hour without participants")
+	}
+}
+
+func TestAnyParticipantKeepsRoomAlive(t *testing.T) {
+	s, m, id, _ := createTest(t)
+	room := s.rooms[id]
+	now := room.Created
+	m.participants = []Participant{{Identity: "viewer-present"}}
+	_ = s.syncRoom(context.Background(), room, now.Add(2*time.Hour))
+	if room.State == "ended" {
+		t.Fatal("room with a participant expired")
 	}
 }
 func TestOriginValidationAndRateLimit(t *testing.T) {
@@ -169,7 +190,7 @@ func TestLiveKitRPC(t *testing.T) {
 		if strings.HasSuffix(r.URL.Path, "CreateRoom") {
 			var b map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&b)
-			if b["max_participants"] != float64(11) {
+			if b["max_participants"] != float64(11) || b["empty_timeout"] != float64(7200) {
 				t.Error(b)
 			}
 		}

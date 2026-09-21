@@ -238,6 +238,38 @@ describe("Studio settings updates", () => {
     expect(busy).toEqual([true, false]);
   });
 
+  it("settles the active mutation before cancellation and discards queued work", async () => {
+    const active = deferred<string>();
+    const applied: number[] = [];
+    let current = "original";
+    const updater = createLatestSettingsUpdater<number, string>({
+      apply: async (next) => {
+        applied.push(next);
+        return active.promise;
+      },
+      rollback: async () => {},
+      readConfirmed: () => 0,
+      onBusy: () => {},
+      onStart: () => {},
+      onApplied: (_next, result) => {
+        current = result;
+      },
+      onSuccess: () => {},
+      onFailure: () => {},
+    });
+
+    updater.enqueue(1);
+    updater.enqueue(2);
+    const settled = updater.settleAndCancel();
+    expect(applied).toEqual([1]);
+    expect(current).toBe("original");
+
+    active.resolve("replacement");
+    await settled;
+    expect(applied).toEqual([1]);
+    expect(current).toBe("replacement");
+  });
+
   it("does not let an old completion clear a restarted session's state", async () => {
     const oldUpdate = deferred<void>();
     const newUpdate = deferred<void>();

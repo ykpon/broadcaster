@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Room, RoomEvent, ConnectionState } from "livekit-client";
+import { Room, RoomEvent, ConnectionState, Track } from "livekit-client";
 import {
   Monitor,
   Check,
@@ -74,6 +74,7 @@ export default function Studio({ id }: { id: string }) {
     [busy, setBusy] = useState(false),
     [qualityBusy, setQualityBusy] = useState(false),
     [live, setLive] = useState(false),
+    [hasBroadcast, setHasBroadcast] = useState(false),
     [ended, setEnded] = useState(false),
     [error, setError] = useState(""),
     [note, setNote] = useState(""),
@@ -93,6 +94,7 @@ export default function Studio({ id }: { id: string }) {
     preview = useRef<HTMLVideoElement>(null),
     started = useRef(0),
     ending = useRef(false),
+    stopping = useRef(false),
     previousVideoSample = useRef<CounterSample | undefined>(undefined),
     previousAudioSample = useRef<CounterSample | undefined>(undefined),
     mounted = useRef(true);
@@ -244,19 +246,62 @@ export default function Studio({ id }: { id: string }) {
     }, 1000);
     return () => clearInterval(timer);
   }, [live]);
+  async function stopPublishing() {
+    setLive(false);
+    await settingsUpdater.settleAndCancel();
+    const room = roomRef.current;
+    const tracks = tracksRef.current;
+    const stream = streamRef.current;
+    tracksRef.current = null;
+    streamRef.current = null;
+    resetDiagnostics();
+    stream?.getTracks().forEach((t) => {
+      t.onended = null;
+    });
+    try {
+      if (room && tracks) {
+        const unpublished: Promise<unknown>[] = [];
+        if (room.localParticipant.getTrackPublication(Track.Source.ScreenShare))
+          unpublished.push(
+            room.localParticipant.unpublishTrack(tracks.video, false),
+          );
+        if (
+          tracks.audio &&
+          room.localParticipant.getTrackPublication(
+            Track.Source.ScreenShareAudio,
+          )
+        )
+          unpublished.push(
+            room.localParticipant.unpublishTrack(tracks.audio, false),
+          );
+        await Promise.all(unpublished);
+      }
+    } finally {
+      stream?.getTracks().forEach((t) => t.stop());
+      if (preview.current) preview.current.srcObject = null;
+    }
+  }
+  async function pause() {
+    if (ending.current || stopping.current || !tracksRef.current) return;
+    stopping.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      await stopPublishing();
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      stopping.current = false;
+      setBusy(false);
+    }
+  }
   async function finish() {
     if (ending.current) return;
     ending.current = true;
-    settingsUpdater.cancel();
     setBusy(true);
-    setLive(false);
-    tracksRef.current = null;
-    resetDiagnostics();
-    streamRef.current?.getTracks().forEach((t) => {
-      t.onended = null;
-      t.stop();
-    });
+    await stopPublishing().catch(() => {});
     await roomRef.current?.disconnect();
+    roomRef.current = null;
     try {
       await api(`/rooms/${id}/end`, { hostSecret: secret });
       setEnded(true);
@@ -275,7 +320,8 @@ export default function Studio({ id }: { id: string }) {
     tracksRef.current = null;
     resetDiagnostics();
     let stream: MediaStream | null = null;
-    let room: Room | null = null;
+    let room = roomRef.current;
+    let connectedHere = false;
     try {
       if (!secret)
         throw new Error(
@@ -295,30 +341,34 @@ export default function Studio({ id }: { id: string }) {
       }
       setNote(await applyQuality(stream.getVideoTracks()[0], settings));
       streamRef.current = stream;
-      const auth = await api<Connection>(`/rooms/${id}/host-token`, {
-        hostSecret: secret,
-      });
-      room = new Room({ adaptiveStream: false, dynacast: false });
-      roomRef.current = room;
-      room.on(RoomEvent.ConnectionStateChanged, setState);
-      room.on(RoomEvent.Disconnected, () => {
-        if (!ending.current && mounted.current && roomRef.current === room) {
-          settingsUpdater.cancel();
-          streamRef.current?.getTracks().forEach((t) => {
-            t.onended = null;
-            t.stop();
-          });
-          setLive(false);
-          tracksRef.current = null;
-          resetDiagnostics();
-          setError(
-            "Соединение прервано. Повторите запуск; убедитесь, что студия не открыта в другой вкладке.",
-          );
-        }
-      });
-      await room.connect(auth.url, auth.token);
+      if (!room || room.state !== ConnectionState.Connected) {
+        const auth = await api<Connection>(`/rooms/${id}/host-token`, {
+          hostSecret: secret,
+        });
+        room = new Room({ adaptiveStream: false, dynacast: false });
+        roomRef.current = room;
+        room.on(RoomEvent.ConnectionStateChanged, setState);
+        room.on(RoomEvent.Disconnected, () => {
+          if (!ending.current && mounted.current && roomRef.current === room) {
+            settingsUpdater.cancel();
+            streamRef.current?.getTracks().forEach((t) => {
+              t.onended = null;
+              t.stop();
+            });
+            roomRef.current = null;
+            setLive(false);
+            tracksRef.current = null;
+            resetDiagnostics();
+            setError(
+              "Соединение прервано. Повторите запуск; убедитесь, что студия не открыта в другой вкладке.",
+            );
+          }
+        });
+        await room.connect(auth.url, auth.token);
+        connectedHere = true;
+      }
       if (!mounted.current) {
-        await room.disconnect();
+        if (connectedHere) await room.disconnect();
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
@@ -329,9 +379,10 @@ export default function Studio({ id }: { id: string }) {
       setSurface(stream.getVideoTracks()[0].getSettings().displaySurface || "");
       setMuted(false);
       stream.getVideoTracks()[0].onended = () => {
-        void finish();
+        void pause();
       };
       setLive(true);
+      setHasBroadcast(true);
       started.current = Date.now();
       setElapsed(0);
       if (preview.current) {
@@ -343,7 +394,10 @@ export default function Studio({ id }: { id: string }) {
       tracksRef.current = null;
       resetDiagnostics();
       stream?.getTracks().forEach((t) => t.stop());
-      await room?.disconnect();
+      if (connectedHere) {
+        await room?.disconnect();
+        if (roomRef.current === room) roomRef.current = null;
+      }
       setError(captureError(e));
     } finally {
       setBusy(false);
@@ -352,7 +406,7 @@ export default function Studio({ id }: { id: string }) {
   function commitSettings(next: StreamSettings) {
     setSettings(next);
     const tracks = tracksRef.current;
-    if (!tracks || !live) {
+    if (stopping.current || !tracks || !live) {
       confirmedSettings.current = next;
       return;
     }
@@ -432,12 +486,16 @@ export default function Studio({ id }: { id: string }) {
                     title={
                       isEnded
                         ? "Хороший эфир. До следующего!"
-                        : "Что покажем сегодня?"
+                        : hasBroadcast
+                          ? "Готовы продолжить?"
+                          : "Что покажем сегодня?"
                     }
                     subtitle={
                       isEnded
                         ? "Трансляция завершена для всех зрителей."
-                        : "Выберите экран, окно приложения или вкладку браузера."
+                        : hasBroadcast
+                          ? "Настройки сохранены. Выберите источник для нового запуска."
+                          : "Выберите экран, окно приложения или вкладку браузера."
                     }
                     icon={isEnded ? <Check size={36} /> : undefined}
                   >
@@ -452,7 +510,13 @@ export default function Studio({ id }: { id: string }) {
                         ) : (
                           <Monitor size={18} />
                         )}{" "}
-                        {busy ? "Подключаем источник…" : "Выбрать источник"}
+                        {busy
+                          ? hasBroadcast
+                            ? "Подготавливаем запуск…"
+                            : "Подключаем источник…"
+                          : hasBroadcast
+                            ? "Запустить снова"
+                            : "Выбрать источник"}
                       </button>
                     )}
                     {isEnded && (
@@ -881,13 +945,24 @@ export default function Studio({ id }: { id: string }) {
               </a>
             </section>
             {!isEnded && (
-              <button
-                className="button danger"
-                disabled={busy}
-                onClick={() => void finish()}
-              >
-                <Square size={15} /> Завершить эфир
-              </button>
+              <div className="room-actions">
+                {live && (
+                  <button
+                    className="button danger"
+                    disabled={busy}
+                    onClick={() => void pause()}
+                  >
+                    <Square size={15} /> Остановить трансляцию
+                  </button>
+                )}
+                <button
+                  className="button secondary close-room"
+                  disabled={busy}
+                  onClick={() => void finish()}
+                >
+                  Закрыть комнату
+                </button>
+              </div>
             )}
             <p className="sidebar-footnote">
               Ваше превью всегда без звука,

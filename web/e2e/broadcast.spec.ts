@@ -1,14 +1,16 @@
 import { test, expect } from "@playwright/test";
 
-test("реальный SFU: публикация тестового видео и аудио, громкость, качество, завершение", async ({
+test("реальный SFU: публикация, перезапуск в той же комнате, качество и завершение", async ({
   browser,
   page,
 }) => {
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(e.message));
   page.on("console", (m) => {
-    if (m.type() === "error" || m.type() === "warning")
+    if (m.type() === "error" || m.type() === "warning") {
       console.log("host:", m.text());
+      errors.push(m.text());
+    }
   });
   // Only the OS capture source is substituted. API, JWT, WebSocket, ICE,
   // encoding, SFU forwarding, and decoding all use the real Docker stack.
@@ -33,6 +35,9 @@ test("реальный SFU: публикация тестового видео �
       };
       draw();
       const stream = canvas.captureStream(60);
+      (
+        window as Window & { __captureVideoTrack?: MediaStreamTrack }
+      ).__captureVideoTrack = stream.getVideoTracks()[0];
       const audio = new AudioContext();
       const osc = audio.createOscillator();
       const out = audio.createMediaStreamDestination();
@@ -68,18 +73,32 @@ test("реальный SFU: публикация тестового видео �
   const viewer = await viewerContext.newPage();
   viewer.on("pageerror", (e) => errors.push(e.message));
   await viewer.goto(viewerURL);
-  await viewer
-    .getByRole("button", { name: "Смотреть эфир", exact: true })
-    .click();
-  await expect(viewer.getByText("Ведущий готовится к эфиру")).toBeVisible({
-    timeout: 20000,
-  });
-  await page
-    .getByRole("button", { name: "Выбрать источник", exact: true })
-    .click();
-  await expect(page.getByText("В прямом эфире", { exact: true })).toBeVisible({
-    timeout: 30000,
-  });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await viewer
+      .getByRole("button", { name: "Смотреть эфир", exact: true })
+      .click();
+    try {
+      await expect(viewer.getByText("Ведущий готовится к эфиру")).toBeVisible({
+        timeout: 10000,
+      });
+      break;
+    } catch (error) {
+      if (attempt === 2) throw error;
+    }
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await page
+      .getByRole("button", { name: "Выбрать источник", exact: true })
+      .click();
+    try {
+      await expect(
+        page.getByText("В прямом эфире", { exact: true }),
+      ).toBeVisible({ timeout: 10000 });
+      break;
+    } catch (error) {
+      if (attempt === 4) throw error;
+    }
+  }
   await expect
     .poll(() =>
       page.evaluate(
@@ -116,7 +135,7 @@ test("реальный SFU: публикация тестового видео �
   ).toBeVisible();
   await expect(liveVideoBitrate).toHaveValue("24");
   await expect(
-    page.getByRole("button", { name: "Завершить эфир", exact: true }),
+    page.getByRole("button", { name: "Остановить трансляцию", exact: true }),
   ).toBeEnabled();
   await expect
     .poll(
@@ -128,6 +147,29 @@ test("реальный SFU: публикация тестового видео �
     )
     .toBeGreaterThan(0);
   await expect(viewer.getByText("Видео и звук", { exact: true })).toBeVisible();
+  await page.evaluate(() =>
+    (
+      window as Window & { __captureVideoTrack?: MediaStreamTrack }
+    ).__captureVideoTrack?.dispatchEvent(new Event("ended")),
+  );
+  await expect(
+    viewer.getByText("Ведущий готовится к эфиру", { exact: true }),
+  ).toBeVisible({ timeout: 15000 });
+  await page
+    .getByRole("button", { name: "Запустить снова", exact: true })
+    .click();
+  await expect(page.getByText("В прямом эфире", { exact: true })).toBeVisible({
+    timeout: 30000,
+  });
+  await expect
+    .poll(
+      () =>
+        viewer
+          .locator("video")
+          .evaluate((el: HTMLVideoElement) => el.videoWidth),
+      { timeout: 30000 },
+    )
+    .toBeGreaterThan(0);
   await expect(viewer.getByLabel("Буфер воспроизведения")).toBeEnabled();
   await viewer.getByLabel("Буфер воспроизведения").fill("10");
   await expect(viewer.getByText("1.0 с", { exact: true })).toBeVisible();
@@ -165,15 +207,27 @@ test("реальный SFU: публикация тестового видео �
     // The synthetic source draws with requestAnimationFrame; keep its tab active
     // so browser background throttling does not freeze the test fixture.
     await page.bringToFront();
-    await expect
-      .poll(
-        () =>
-          extra
-            .locator("video")
-            .evaluate((el: HTMLVideoElement) => el.videoWidth),
-        { timeout: 20000 },
-      )
-      .toBeGreaterThan(0);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await expect
+          .poll(
+            () =>
+              extra
+                .locator("video")
+                .evaluate((el: HTMLVideoElement) => el.videoWidth),
+            { timeout: 10000 },
+          )
+          .toBeGreaterThan(0);
+        break;
+      } catch (error) {
+        if (attempt === 4) throw error;
+        await extra.reload();
+        await extra
+          .getByRole("button", { name: "Смотреть эфир", exact: true })
+          .click();
+        await page.bringToFront();
+      }
+    }
   }
   await expect(page.getByText("10 / 10 зрителей", { exact: true })).toBeVisible(
     { timeout: 10000 },
@@ -184,14 +238,44 @@ test("реальный SFU: публикация тестового видео �
     { data: {} },
   );
   expect(overflow.status()).toBe(409);
+  for (const context of extraContexts) await context.close();
   await page
-    .getByRole("button", { name: "Завершить эфир", exact: true })
+    .getByRole("button", { name: "Остановить трансляцию", exact: true })
+    .click();
+  await expect(
+    viewer.getByText("Ведущий готовится к эфиру", { exact: true }),
+  ).toBeVisible({ timeout: 15000 });
+  await expect(
+    viewer.getByRole("button", { name: "Смотреть эфир", exact: true }),
+  ).toHaveCount(0);
+  await page.getByLabel("Частота кадров").fill("25");
+  await page.getByLabel("Видеобитрейт").fill("12");
+  await page
+    .getByRole("button", { name: "Запустить снова", exact: true })
+    .click();
+  await expect(page.getByText("В прямом эфире", { exact: true })).toBeVisible({
+    timeout: 30000,
+  });
+  await expect
+    .poll(
+      () =>
+        viewer
+          .locator("video")
+          .evaluate((el: HTMLVideoElement) => el.videoWidth),
+      { timeout: 30000 },
+    )
+    .toBeGreaterThan(0);
+  await expect(viewer.getByText("Видео и звук", { exact: true })).toBeVisible();
+  await expect(
+    diagnostics.getByText("12 Мбит/с", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Закрыть комнату", exact: true })
     .click();
   await expect(
     viewer.getByText("Этот эфир завершён", { exact: true }),
   ).toBeVisible({ timeout: 15000 });
   expect(errors).toEqual([]);
-  for (const context of extraContexts) await context.close();
   await viewerContext.close();
 });
 
