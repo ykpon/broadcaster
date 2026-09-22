@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,119 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 )
+
+// The gate pauses an actual socket write, making the final event remain queued
+// while an in-flight reader result requests closure. No production hooks or
+// timing-dependent loop are needed to choose this otherwise rare interleaving.
+type signalWriteGate struct {
+	net.Conn
+	mu               sync.Mutex
+	entered, release chan struct{}
+}
+
+func (c *signalWriteGate) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	entered, release := c.entered, c.release
+	c.entered = nil
+	c.mu.Unlock()
+	if entered != nil {
+		close(entered)
+		<-release
+	}
+	return c.Conn.Write(b)
+}
+
+type signalGateListener struct {
+	net.Listener
+	accepted chan *signalWriteGate
+}
+
+func (l *signalGateListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	gate := &signalWriteGate{Conn: c}
+	l.accepted <- gate
+	return gate, nil
+}
+
+func TestSignalTerminalEventWinsOverPendingReaderClose(t *testing.T) {
+	for _, scenario := range []string{"end", "stop", "end-with-pending-close", "stop-with-pending-close"} {
+		t.Run(scenario, func(t *testing.T) {
+			action := strings.Split(scenario, "-")[0]
+			pendingClose := strings.HasSuffix(scenario, "-with-pending-close")
+			s, _, id, secret := createTest(t)
+			ts := httptest.NewUnstartedServer(s.Handler())
+			listener := &signalGateListener{Listener: ts.Listener, accepted: make(chan *signalWriteGate, 4)}
+			ts.Listener = listener
+			ts.Start()
+			t.Cleanup(ts.Close)
+			var client *websocket.Conn
+			var key, event string
+			var incoming clientSignal
+			if action == "end" {
+				client, key = joinSignal(t, s, ts, id)
+				event = "room-ended"
+				incoming = clientSignal{Type: "peer-ready", Generation: 1}
+			} else {
+				client, _ = startSignal(t, s, ts, id, secret, TransportP2P)
+				key, event = "host", "broadcast-stopped"
+				incoming = clientSignal{Type: "broadcast-ready", Generation: 1}
+			}
+			gate := <-listener.accepted
+			entered, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			t.Cleanup(unblock)
+			gate.mu.Lock()
+			gate.entered, gate.release = entered, release
+			gate.mu.Unlock()
+			s.mu.Lock()
+			peer := s.rooms[id].Peers[key]
+			peer.send(serverSignal{Type: "test-barrier"})
+			s.mu.Unlock()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("writer did not reach gate")
+			}
+			body := `{"hostSecret":"` + secret + `"}`
+			if action == "stop" {
+				body = `{"hostSecret":"` + secret + `","generation":1}`
+			}
+			if pendingClose {
+				peer.close(websocket.StatusPolicyViolation)
+			}
+			if code, result := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/"+action, body); code != 200 {
+				t.Fatal(code, result)
+			}
+			sendSignal(t, client, incoming)
+			// Force the pending reader outcome as well: it may already have read
+			// this frame before the lifecycle commit. This uses the actual routing
+			// and close methods while the real socket writer is paused.
+			if !s.routeSignal(id, peer, incoming) {
+				peer.close(websocket.StatusPolicyViolation)
+			}
+			peer.close(websocket.StatusNormalClosure) // reader's deferred cleanup
+			if !pendingClose {
+				select {
+				case code := <-peer.closing:
+					t.Errorf("reader queued out-of-band close %v ahead of %s", code, event)
+				default:
+				}
+			}
+			unblock()
+			readSignal(t, client, "test-barrier")
+			readSignal(t, client, event)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, _, err := client.Read(ctx); websocket.CloseStatus(err) != websocket.StatusNormalClosure {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestSignalTicketIsSingleUseBoundAndExpires(t *testing.T) {
 	s, _, id, _ := createTest(t)

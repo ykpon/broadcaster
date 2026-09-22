@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -153,6 +154,10 @@ type signalPeer struct {
 	out     chan signalEnvelope
 	closing chan websocket.StatusCode
 	done    chan struct{}
+	// sendMu serializes terminal enqueue with reader cleanup and policy closes.
+	// It is never held during socket I/O.
+	sendMu   sync.Mutex
+	graceful bool
 	// The following fields are protected by Server.mu.
 	messages            []time.Time
 	candidateGeneration uint64
@@ -174,18 +179,40 @@ func (p *signalPeer) send(message serverSignal) {
 }
 
 func (p *signalPeer) enqueue(envelope signalEnvelope) {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	if p.graceful {
+		return
+	}
 	select {
 	case p.out <- envelope:
+		// Once the final event is queued, its writer owns closing the socket.
+		p.graceful = envelope.closeCode != 0
 	default:
-		p.close(websocket.StatusPolicyViolation)
+		p.closeLocked(websocket.StatusPolicyViolation)
 	}
 }
 
 func (p *signalPeer) close(code websocket.StatusCode) {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	p.closeLocked(code)
+}
+
+func (p *signalPeer) closeLocked(code websocket.StatusCode) {
+	if p.graceful {
+		return
+	}
 	select {
 	case p.closing <- code:
 	default:
 	}
+}
+
+func (p *signalPeer) closingGracefully() bool {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	return p.graceful
 }
 
 func (p *signalPeer) writeLoop(ctx context.Context, cancel context.CancelFunc) {
@@ -197,6 +224,11 @@ func (p *signalPeer) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 		case <-ctx.Done():
 			return
 		case code := <-p.closing:
+			// A close requested just before the lifecycle commit may already be
+			// queued. The final event takes precedence once it has been committed.
+			if p.closingGracefully() {
+				continue
+			}
 			_ = p.conn.Close(code, "control connection closed")
 			return
 		case envelope := <-p.out:
