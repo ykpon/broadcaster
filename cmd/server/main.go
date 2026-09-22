@@ -11,9 +11,17 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
+
+type stunService interface {
+	Addr() net.Addr
+	Close() error
+	Done() <-chan struct{}
+	Err() error
+}
 
 type config struct {
 	appURL, mediaURL, webDir   string
@@ -24,7 +32,9 @@ type config struct {
 	media                      broadcast.Media
 	cleanup                    func(context.Context) error
 	listenHTTP                 func(string, string) (net.Listener, error)
-	listenSTUN                 func(context.Context, string) (*broadcast.STUNServer, error)
+	listenSTUN                 func(context.Context, string) (stunService, error)
+	shutdownTimeout            time.Duration
+	wrapHandler                func(http.Handler) http.Handler
 }
 
 func env(key, fallback string) string {
@@ -69,8 +79,36 @@ func configFromEnv() config {
 		media:          media,
 		cleanup:        media.Cleanup,
 		listenHTTP:     net.Listen,
-		listenSTUN:     broadcast.ListenSTUN,
+		listenSTUN: func(ctx context.Context, address string) (stunService, error) {
+			return broadcast.ListenSTUN(ctx, address)
+		},
+		shutdownTimeout: 10 * time.Second,
+		wrapHandler:     func(handler http.Handler) http.Handler { return handler },
 	}
+}
+
+func shutdownServers(cancel context.CancelFunc, api *broadcast.Server, server *http.Server, timeout time.Duration) error {
+	cancel()
+	ctx, contextCancel := context.WithTimeout(context.Background(), timeout)
+	defer contextCancel()
+	httpResult := make(chan error, 1)
+	controlResult := make(chan error, 1)
+	go func() { httpResult <- server.Shutdown(ctx) }()
+	go func() { controlResult <- api.Shutdown(ctx) }()
+
+	httpErr := <-httpResult
+	var closeErr error
+	if httpErr != nil {
+		closeErr = server.Close()
+		if errors.Is(closeErr, http.ErrServerClosed) {
+			closeErr = nil
+		}
+	}
+	controlErr := <-controlResult
+	if httpErr == nil && controlErr == nil && closeErr == nil {
+		return nil
+	}
+	return fmt.Errorf("shutdown incomplete: %w", errors.Join(httpErr, controlErr, closeErr))
 }
 
 func run(ctx context.Context, cfg config) error {
@@ -111,34 +149,48 @@ func run(ctx context.Context, cfg config) error {
 
 	server := &http.Server{
 		Addr:              cfg.listenAddr,
-		Handler:           api.Handler(),
+		Handler:           cfg.wrapHandler(api.Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	serveDone := make(chan struct{})
-	shutdownDone := make(chan struct{})
-	go func() {
-		defer close(shutdownDone)
-		select {
-		case <-runCtx.Done():
-			shutdown, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer shutdownCancel()
-			_ = server.Shutdown(shutdown)
-		case <-serveDone:
-		}
-	}()
 	log.Printf("Broadcast listening on %s; STUN listening on %s", listener.Addr(), stunServer.Addr())
-	err = server.Serve(listener)
-	close(serveDone)
-	<-shutdownDone
-	cancel()
+	serveResult := make(chan error, 1)
+	go func() { serveResult <- server.Serve(listener) }()
+	shutdownResult := make(chan error, 1)
+	var shutdownOnce sync.Once
+	startShutdown := func() {
+		shutdownOnce.Do(func() {
+			go func() {
+				shutdownResult <- shutdownServers(cancel, api, server, cfg.shutdownTimeout)
+			}()
+		})
+	}
+	var runErr error
+	select {
+	case err = <-serveResult:
+	case <-runCtx.Done():
+		startShutdown()
+		err = <-serveResult
+	case <-stunServer.Done():
+		if runCtx.Err() == nil {
+			if stunErr := stunServer.Err(); stunErr != nil {
+				runErr = fmt.Errorf("STUN server stopped: %w", stunErr)
+			} else {
+				runErr = errors.New("STUN server stopped unexpectedly")
+			}
+		}
+		startShutdown()
+		err = <-serveResult
+	}
+	startShutdown()
+	shutdownErr := <-shutdownResult
 	<-cleanupDone
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+		runErr = errors.Join(runErr, err)
 	}
-	return nil
+	return errors.Join(runErr, shutdownErr)
 }
 
 func main() {

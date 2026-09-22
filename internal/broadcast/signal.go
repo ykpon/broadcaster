@@ -248,7 +248,76 @@ func (p *signalPeer) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 	}
 }
 
+func (s *Server) beginControlHandler() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shuttingDown {
+		return false
+	}
+	s.controlWG.Add(1)
+	return true
+}
+
+func (s *Server) trackControlPeer(p *signalPeer) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shuttingDown {
+		return false
+	}
+	s.controlPeers[p] = struct{}{}
+	return true
+}
+
+func (s *Server) untrackControlPeer(p *signalPeer) {
+	s.mu.Lock()
+	delete(s.controlPeers, p)
+	s.mu.Unlock()
+}
+
+// Shutdown gracefully closes every accepted control socket and waits for its
+// handler to exit. Once ctx expires, remaining sockets are force-closed.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.shutdownOnce.Do(func() {
+		s.mu.Lock()
+		s.shuttingDown = true
+		peers := make([]*signalPeer, 0, len(s.controlPeers))
+		for peer := range s.controlPeers {
+			peers = append(peers, peer)
+		}
+		s.mu.Unlock()
+		for _, peer := range peers {
+			peer.close(websocket.StatusGoingAway)
+		}
+		go func() {
+			s.controlWG.Wait()
+			close(s.shutdownDone)
+		}()
+	})
+	select {
+	case <-s.shutdownDone:
+		return nil
+	case <-ctx.Done():
+	}
+
+	s.mu.Lock()
+	peers := make([]*signalPeer, 0, len(s.controlPeers))
+	for peer := range s.controlPeers {
+		peers = append(peers, peer)
+	}
+	s.mu.Unlock()
+	for _, peer := range peers {
+		_ = peer.conn.CloseNow()
+	}
+	<-s.shutdownDone
+	return ctx.Err()
+}
+
 func (s *Server) signal(w http.ResponseWriter, r *http.Request) {
+	if !s.beginControlHandler() {
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.controlWG.Done()
 	// Handler validates the complete public Origin (including scheme and port).
 	// Accept additionally applies its standard same-host origin policy.
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
@@ -258,6 +327,12 @@ func (s *Server) signal(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(256 << 10)
 	ctx, cancel := context.WithCancel(r.Context())
 	p := &signalPeer{conn: conn, out: make(chan signalEnvelope, 1024), closing: make(chan websocket.StatusCode, 1), done: make(chan struct{})}
+	if !s.trackControlPeer(p) {
+		cancel()
+		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
+		return
+	}
+	defer s.untrackControlPeer(p)
 	go p.writeLoop(ctx, cancel)
 	defer func() { p.close(websocket.StatusNormalClosure); <-p.done; cancel() }()
 	firstCtx, firstCancel := context.WithTimeout(ctx, 10*time.Second)

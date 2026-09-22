@@ -47,6 +47,11 @@ type Server struct {
 	mu                          sync.Mutex
 	rooms                       map[string]*Room
 	limits                      map[string]bucket
+	controlPeers                map[*signalPeer]struct{}
+	controlWG                   sync.WaitGroup
+	shutdownOnce                sync.Once
+	shutdownDone                chan struct{}
+	shuttingDown                bool
 	media                       Media
 	PublicURL, MediaURL, WebDir string
 	STUNURL                     string
@@ -56,7 +61,7 @@ type Server struct {
 }
 
 func New(media Media, publicURL, mediaURL, webDir string) *Server {
-	return &Server{rooms: make(map[string]*Room), limits: make(map[string]bucket), media: media, PublicURL: strings.TrimRight(publicURL, "/"), MediaURL: mediaURL, WebDir: webDir, STUNURL: "stun:localhost:3478", now: time.Now, afterFunc: func(d time.Duration, f func()) signalTimer { return time.AfterFunc(d, f) }}
+	return &Server{rooms: make(map[string]*Room), limits: make(map[string]bucket), controlPeers: make(map[*signalPeer]struct{}), shutdownDone: make(chan struct{}), media: media, PublicURL: strings.TrimRight(publicURL, "/"), MediaURL: mediaURL, WebDir: webDir, STUNURL: "stun:localhost:3478", now: time.Now, afterFunc: func(d time.Duration, f func()) signalTimer { return time.AfterFunc(d, f) }}
 }
 func randomID() string {
 	b := make([]byte, 24)

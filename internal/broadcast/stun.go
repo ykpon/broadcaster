@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/stun/v3"
@@ -21,20 +22,56 @@ const (
 	stunLogWindow      = time.Second
 	stunMaxSources     = 4096
 	stunBucketLifetime = time.Minute
+	stunInitialRetry   = 10 * time.Millisecond
+	stunMaxRetryDelay  = time.Second
 )
 
 type stunBucket struct {
-	tokens          float64
-	updated         time.Time
+	limiter         *stunTokenBucket
 	malformedLogged time.Time
 }
 
+type stunTokenBucket struct {
+	tokens  float64
+	updated time.Time
+	now     func() time.Time
+}
+
+func newSTUNTokenBucket(now func() time.Time) *stunTokenBucket {
+	return &stunTokenBucket{tokens: stunBurst, updated: now(), now: now}
+}
+
+func (b *stunTokenBucket) allow() bool {
+	now := b.now()
+	b.tokens = min(stunBurst, b.tokens+now.Sub(b.updated).Seconds()*stunRate)
+	b.updated = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+type stunPacketConn interface {
+	ReadFromUDP([]byte) (int, *net.UDPAddr, error)
+	WriteToUDP([]byte, *net.UDPAddr) (int, error)
+	LocalAddr() net.Addr
+	Close() error
+}
+
+type stunRetryWait func(context.Context, time.Duration) bool
+
 // STUNServer is a bounded UDP STUN Binding service.
 type STUNServer struct {
-	conn      *net.UDPConn
+	conn      stunPacketConn
 	addr      net.Addr
+	ctx       context.Context
+	retryWait stunRetryWait
+	closing   atomic.Bool
 	closeOnce sync.Once
 	closeErr  error
+	errMu     sync.Mutex
+	serveErr  error
 	serveDone chan struct{}
 	watchDone chan struct{}
 }
@@ -82,9 +119,15 @@ func ListenSTUN(ctx context.Context, address string) (*STUNServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen for STUN: %w", err)
 	}
+	return newSTUNServer(ctx, conn, waitSTUNRetry), nil
+}
+
+func newSTUNServer(ctx context.Context, conn stunPacketConn, retryWait stunRetryWait) *STUNServer {
 	server := &STUNServer{
 		conn:      conn,
 		addr:      conn.LocalAddr(),
+		ctx:       ctx,
+		retryWait: retryWait,
 		serveDone: make(chan struct{}),
 		watchDone: make(chan struct{}),
 	}
@@ -97,12 +140,24 @@ func ListenSTUN(ctx context.Context, address string) (*STUNServer, error) {
 		case <-server.serveDone:
 		}
 	}()
-	return server, nil
+	return server
 }
 
 // Addr returns the UDP address owned by the server.
 func (s *STUNServer) Addr() net.Addr {
 	return s.addr
+}
+
+// Done closes if the serve loop stops, including after an unexpected fatal error.
+func (s *STUNServer) Done() <-chan struct{} {
+	return s.serveDone
+}
+
+// Err reports an unexpected serve-loop failure after Done is closed.
+func (s *STUNServer) Err() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.serveErr
 }
 
 // Close stops the server and waits for its read loop to exit. It is idempotent.
@@ -115,10 +170,33 @@ func (s *STUNServer) Close() error {
 
 func (s *STUNServer) closeConn() {
 	s.closeOnce.Do(func() {
+		s.closing.Store(true)
 		if err := s.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.closeErr = err
 		}
 	})
+}
+
+func (s *STUNServer) fail(err error) {
+	s.errMu.Lock()
+	s.serveErr = err
+	s.errMu.Unlock()
+}
+
+func waitSTUNRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func isTemporarySTUNError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
 }
 
 func (s *STUNServer) serve() {
@@ -127,15 +205,31 @@ func (s *STUNServer) serve() {
 	buckets := make(map[string]*stunBucket)
 	buffer := make([]byte, stunPacketSize)
 	lastPrune := time.Now()
+	retryDelay := stunInitialRetry
 	for {
 		n, source, err := s.conn.ReadFromUDP(buffer)
 		if err != nil {
+			if s.closing.Load() && errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if isTemporarySTUNError(err) {
+				log.Printf("temporary STUN read failure; retrying in %s: %v", retryDelay, err)
+				if s.retryWait(s.ctx, retryDelay) {
+					retryDelay = min(stunMaxRetryDelay, retryDelay*2)
+					continue
+				}
+				if s.ctx.Err() != nil || s.closing.Load() {
+					return
+				}
+			}
+			s.fail(fmt.Errorf("STUN read failed: %w", err))
 			return
 		}
+		retryDelay = stunInitialRetry
 		now := time.Now()
 		if now.Sub(lastPrune) >= stunBucketLifetime {
 			for ip, candidate := range buckets {
-				if now.Sub(candidate.updated) >= stunBucketLifetime {
+				if now.Sub(candidate.limiter.updated) >= stunBucketLifetime {
 					delete(buckets, ip)
 				}
 			}
@@ -146,16 +240,12 @@ func (s *STUNServer) serve() {
 			if len(buckets) >= stunMaxSources {
 				continue
 			}
-			bucket = &stunBucket{tokens: stunBurst, updated: now}
+			bucket = &stunBucket{limiter: newSTUNTokenBucket(time.Now)}
 			buckets[source.IP.String()] = bucket
 		}
-		elapsed := now.Sub(bucket.updated).Seconds()
-		bucket.tokens = min(stunBurst, bucket.tokens+elapsed*stunRate)
-		bucket.updated = now
-		if bucket.tokens < 1 {
+		if !bucket.limiter.allow() {
 			continue
 		}
-		bucket.tokens--
 
 		request := new(stun.Message)
 		request.Raw = append(request.Raw, buffer[:n]...)
@@ -179,7 +269,10 @@ func (s *STUNServer) serve() {
 			continue
 		}
 		if _, err := s.conn.WriteToUDP(response.Raw, source); err != nil {
-			return
+			if s.closing.Load() && errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("STUN response write to %s failed: %v", source, err)
 		}
 	}
 }
