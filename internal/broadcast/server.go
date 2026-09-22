@@ -21,20 +21,23 @@ import (
 )
 
 type Room struct {
-	ID                         string               `json:"roomId"`
-	State                      string               `json:"state"`
-	Viewers                    int                  `json:"viewers"`
-	Generation                 uint64               `json:"generation"`
-	Transport                  Transport            `json:"transport,omitempty"`
-	ViewerLimit                ViewerLimit          `json:"-"`
-	Secret                     [32]byte             `json:"-"`
-	MediaRoom                  string               `json:"-"`
-	Active                     bool                 `json:"-"`
-	Created, EmptySince, Ended time.Time            `json:"-"`
-	Deleted                    bool                 `json:"-"`
-	Seats                      map[string]time.Time `json:"-"`
-	Tickets                    map[string]time.Time `json:"-"`
-	Peers                      map[string]struct{}  `json:"-"`
+	ID                         string                    `json:"roomId"`
+	State                      string                    `json:"state"`
+	Viewers                    int                       `json:"viewers"`
+	Generation                 uint64                    `json:"generation"`
+	Transport                  Transport                 `json:"transport,omitempty"`
+	ViewerLimit                ViewerLimit               `json:"-"`
+	Secret                     [32]byte                  `json:"-"`
+	MediaRoom                  string                    `json:"-"`
+	Active                     bool                      `json:"-"`
+	Created, EmptySince, Ended time.Time                 `json:"-"`
+	Deleted                    bool                      `json:"-"`
+	Seats                      map[string]time.Time      `json:"-"`
+	Tickets                    map[[32]byte]ticketRecord `json:"-"`
+	Peers                      map[string]*signalPeer    `json:"-"`
+	HostGrace                  *hostGrace                `json:"-"`
+	Controlled                 bool                      `json:"-"`
+	Legacy                     bool                      `json:"-"`
 }
 type bucket struct {
 	Start time.Time
@@ -48,10 +51,12 @@ type Server struct {
 	PublicURL, MediaURL, WebDir string
 	STUNURL                     string
 	TrustProxy                  bool
+	now                         func() time.Time
+	afterFunc                   func(time.Duration, func()) signalTimer
 }
 
 func New(media Media, publicURL, mediaURL, webDir string) *Server {
-	return &Server{rooms: make(map[string]*Room), limits: make(map[string]bucket), media: media, PublicURL: strings.TrimRight(publicURL, "/"), MediaURL: mediaURL, WebDir: webDir, STUNURL: "stun:localhost:3478"}
+	return &Server{rooms: make(map[string]*Room), limits: make(map[string]bucket), media: media, PublicURL: strings.TrimRight(publicURL, "/"), MediaURL: mediaURL, WebDir: webDir, STUNURL: "stun:localhost:3478", now: time.Now, afterFunc: func(d time.Duration, f func()) signalTimer { return time.AfterFunc(d, f) }}
 }
 func randomID() string {
 	b := make([]byte, 24)
@@ -88,6 +93,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/rooms/{id}", s.status)
 	mux.HandleFunc("POST /api/rooms/{id}/start", s.start)
 	mux.HandleFunc("POST /api/rooms/{id}/stop", s.stop)
+	mux.HandleFunc("POST /api/rooms/{id}/join", s.join)
+	mux.HandleFunc("POST /api/rooms/{id}/signal-ticket", s.signalTicket)
+	mux.HandleFunc("GET /api/rooms/{id}/signal", s.signal)
 	mux.HandleFunc("POST /api/rooms/{id}/host-token", s.host)
 	mux.HandleFunc("POST /api/rooms/{id}/viewer-token", s.viewer)
 	mux.HandleFunc("POST /api/rooms/{id}/end", s.end)
@@ -142,7 +150,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	id, secret := randomID(), randomID()
 	now := time.Now()
 	limit, _ := ParseViewerLimit("10")
-	room := &Room{ID: id, State: "waiting", Secret: sha256.Sum256([]byte(secret)), ViewerLimit: limit, Created: now, EmptySince: now, Seats: make(map[string]time.Time), Tickets: make(map[string]time.Time), Peers: make(map[string]struct{})}
+	room := &Room{ID: id, State: "waiting", Secret: sha256.Sum256([]byte(secret)), ViewerLimit: limit, Created: now, EmptySince: now, Seats: make(map[string]time.Time), Tickets: make(map[[32]byte]ticketRecord), Peers: make(map[string]*signalPeer)}
 	s.rooms[id] = room
 	writeJSON(w, 201, map[string]string{"roomId": id, "viewerUrl": s.PublicURL + "/watch/" + id, "hostUrl": s.PublicURL + "/studio/" + id + "#key=" + secret})
 }
@@ -211,7 +219,7 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, response)
 }
 
-func (s *Server) startRoom(ctx context.Context, id, secret string, transport Transport, limit ViewerLimit, anonymous bool) (StartResponse, int, string) {
+func (s *Server) startRoom(ctx context.Context, id, secret string, transport Transport, limit ViewerLimit, legacy bool) (StartResponse, int, string) {
 	s.mu.Lock()
 	room := s.rooms[id]
 	if room == nil {
@@ -226,7 +234,9 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		s.mu.Unlock()
 		return StartResponse{}, 409, "Эфир уже запущен"
 	}
-	if !anonymous {
+	// Legacy requests were authorized by ensureLegacyServer; its viewer adapter
+	// also intentionally permits the initial anonymous server generation.
+	if !legacy {
 		hash := sha256.Sum256([]byte(secret))
 		if subtle.ConstantTimeCompare(hash[:], room.Secret[:]) != 1 {
 			s.mu.Unlock()
@@ -269,14 +279,16 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 	room.ViewerLimit = limit
 	room.MediaRoom = mediaRoom
 	room.Active = true
-	room.State = "live"
+	room.Legacy = legacy
+	room.State = "waiting"
 	room.Deleted = false
-	response := StartResponse{Generation: room.Generation, Transport: room.Transport}
+	response := StartResponse{Generation: room.Generation, Transport: room.Transport, Ticket: s.issueTicketLocked(room, signalAuth{Role: "host", Generation: room.Generation})}
 	if transport == TransportP2P {
 		response.IceServers = []IceServer{{URLs: []string{s.STUNURL}}}
 	} else {
 		response.LiveKit = &LiveKitConnection{URL: s.MediaURL, Token: s.media.Token(room.MediaRoom, "host", true)}
 	}
+	s.notifyStarted(room)
 	s.mu.Unlock()
 
 	if oldMediaRoom != "" && oldMediaRoom != mediaRoom {
@@ -315,7 +327,7 @@ func (s *Server) ensureLegacyServer(ctx context.Context, id, secret string, auth
 	}
 	s.mu.Unlock()
 	limit, _ := ParseViewerLimit("10")
-	_, code, message := s.startRoom(ctx, id, secret, TransportServer, limit, !authenticated)
+	_, code, message := s.startRoom(ctx, id, secret, TransportServer, limit, true)
 	return code, message
 }
 
@@ -345,22 +357,12 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 		problem(w, 409, "Запуск уже изменился")
 		return
 	}
-	mediaRoom := room.MediaRoom
-	room.Active = false
-	room.State = "waiting"
-	room.EmptySince = time.Now()
+	mediaRoom := s.stopGeneration(room)
 	s.mu.Unlock()
-	if mediaRoom != "" {
-		if err := s.media.Delete(r.Context(), mediaRoom); err != nil {
-			log.Print(err)
-			problem(w, 503, "Не удалось остановить медиасервер")
-			return
-		}
-		s.mu.Lock()
-		if room := s.rooms[r.PathValue("id")]; room != nil && room.MediaRoom == mediaRoom {
-			room.MediaRoom = ""
-		}
-		s.mu.Unlock()
+	if err := s.deleteStoppedMedia(r.Context(), r.PathValue("id"), mediaRoom); err != nil {
+		log.Print(err)
+		problem(w, 503, "Не удалось остановить медиасервер")
+		return
 	}
 	writeJSON(w, 200, map[string]any{"state": "waiting", "generation": input.Generation})
 }
@@ -461,15 +463,19 @@ func (s *Server) markEnded(room *Room, now time.Time) {
 	if room.State != "ended" {
 		room.State = "ended"
 		room.Ended = now
+		room.Active = false
+		s.closeRoomPeers(room)
 	}
 }
 func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error {
 	if room.State == "ended" {
 		return nil
 	}
-	if room.Transport != TransportServer || room.MediaRoom == "" {
+	if room.Transport != TransportServer || room.MediaRoom == "" || room.Controlled {
 		s.expireSeats(room, now)
-		if !room.Active {
+		if len(room.Peers) > 0 {
+			room.EmptySince = time.Time{}
+		} else {
 			if room.EmptySince.IsZero() {
 				room.EmptySince = now
 			}
@@ -499,10 +505,12 @@ func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error 
 		}
 	}
 	s.expireSeats(room, now)
-	if host && video {
-		room.State = "live"
-	} else {
-		room.State = "waiting"
+	if room.Legacy {
+		if host && video {
+			room.State = "live"
+		} else {
+			room.State = "waiting"
+		}
 	}
 	if len(participants) > 0 {
 		room.EmptySince = time.Time{}
@@ -517,7 +525,7 @@ func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error 
 
 func (s *Server) expireSeats(room *Room, now time.Time) {
 	for id, expiry := range room.Seats {
-		if now.After(expiry) {
+		if room.Peers[id] == nil && !now.Before(expiry) {
 			delete(room.Seats, id)
 		}
 	}

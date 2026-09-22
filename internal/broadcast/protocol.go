@@ -28,7 +28,41 @@ type IceServer struct {
 type StartResponse struct {
 	Generation uint64             `json:"generation"`
 	Transport  Transport          `json:"transport"`
-	Ticket     string             `json:"ticket,omitempty"`
+	Ticket     string             `json:"ticket"`
 	IceServers []IceServer        `json:"iceServers,omitempty"`
 	LiveKit    *LiveKitConnection `json:"livekit,omitempty"`
+}
+
+type JoinResponse struct {
+	Session string `json:"session"`
+	Ticket  string `json:"ticket"`
+}
+
+type ICECandidate struct {
+	Candidate        string  `json:"candidate"`
+	SDPMid           *string `json:"sdpMid,omitempty"`
+	SDPMLineIndex    *uint16 `json:"sdpMLineIndex,omitempty"`
+	UsernameFragment *string `json:"usernameFragment,omitempty"`
+}
+
+type clientSignal struct {
+	Type       string        `json:"type"`
+	Ticket     string        `json:"ticket,omitempty"`
+	Generation uint64        `json:"generation,omitempty"`
+	Viewer     string        `json:"viewer,omitempty"`
+	SDP        string        `json:"sdp,omitempty"`
+	Candidate  *ICECandidate `json:"candidate,omitempty"`
+}
+
+type serverSignal struct {
+	Type        string             `json:"type"`
+	Generation  uint64             `json:"generation,omitempty"`
+	Transport   Transport          `json:"transport,omitempty"`
+	Viewer      string             `json:"viewer,omitempty"`
+	ViewerLimit string             `json:"viewerLimit,omitempty"`
+	SDP         string             `json:"sdp,omitempty"`
+	Candidate   *ICECandidate      `json:"candidate,omitempty"`
+	IceServers  []IceServer        `json:"iceServers,omitempty"`
+	LiveKit     *LiveKitConnection `json:"livekit,omitempty"`
+	Error       string             `json:"error,omitempty"`
 }
