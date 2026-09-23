@@ -60,10 +60,10 @@ func TestRoomPermissionsAndEnd(t *testing.T) {
 	s, m, id, secret := createTest(t)
 	h := s.Handler()
 	path := "/api/rooms/" + id
-	if c, _ := call(t, h, "POST", path+"/host-token", `{"hostSecret":"bad"}`); c != 403 {
+	if c, _ := call(t, h, "POST", path+"/start", `{"hostSecret":"bad","transport":"server","viewerLimit":"10"}`); c != 403 {
 		t.Fatal(c)
 	}
-	if c, _ := call(t, h, "POST", path+"/host-token", `{"hostSecret":"`+secret+`"}`); c != 200 {
+	if c, _ := call(t, h, "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); c != 200 {
 		t.Fatal(c)
 	}
 	_, info := call(t, h, "GET", path, "")
@@ -76,7 +76,7 @@ func TestRoomPermissionsAndEnd(t *testing.T) {
 	if c, _ := call(t, h, "POST", path+"/viewer-token", `{}`); c != 410 {
 		t.Fatal(c)
 	}
-	if c, _ := call(t, h, "POST", path+"/host-token", `{"hostSecret":"`+secret+`"}`); c != 410 {
+	if c, _ := call(t, h, "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); c != 410 {
 		t.Fatal(c)
 	}
 }
@@ -89,6 +89,22 @@ func TestCreateRoomDoesNotRequireLiveKitAndDefaultsToTen(t *testing.T) {
 	_, info := call(t, s.Handler(), "GET", "/api/rooms/"+id, "")
 	if info["viewerLimit"] != "10" || info["generation"] != float64(0) {
 		t.Fatal(info)
+	}
+}
+
+func TestHostTokenRouteIsGoneWhileLegacyViewerTokenWorks(t *testing.T) {
+	s, media, id, secret := createTest(t)
+	path := "/api/rooms/" + id
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest("POST", path+"/host-token", strings.NewReader(`{"hostSecret":"`+secret+`"}`)))
+	if w.Code != 405 {
+		t.Fatalf("host-token returned %d, want 405", w.Code)
+	}
+	if len(media.created) != 0 {
+		t.Fatalf("host-token created media room: %v", media.created)
+	}
+	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
+		t.Fatalf("legacy viewer-token returned %d, want 200", code)
 	}
 }
 
@@ -220,10 +236,10 @@ func TestStartRejectsLimitBelowReservedSessions(t *testing.T) {
 	}
 }
 
-func TestLegacyTokenEndpointsLazilyPrepareServerGenerationOne(t *testing.T) {
-	s, media, id, secret := createTest(t)
+func TestLegacyViewerTokenLazilyPreparesServerGenerationOne(t *testing.T) {
+	s, media, id, _ := createTest(t)
 	path := "/api/rooms/" + id
-	if code, _ := call(t, s.Handler(), "POST", path+"/host-token", `{"hostSecret":"`+secret+`"}`); code != 200 {
+	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
 		t.Fatal(code)
 	}
 	room := s.rooms[id]

@@ -144,6 +144,21 @@ export async function publishScreen(
   }
 }
 
+export async function unpublishScreen(
+  room: Room,
+  tracks: PublishedTracks,
+): Promise<void> {
+  const pending: Promise<unknown>[] = [];
+  if (room.localParticipant.getTrackPublication(Track.Source.ScreenShare))
+    pending.push(room.localParticipant.unpublishTrack(tracks.video, false));
+  if (
+    tracks.audio &&
+    room.localParticipant.getTrackPublication(Track.Source.ScreenShareAudio)
+  )
+    pending.push(room.localParticipant.unpublishTrack(tracks.audio, false));
+  await Promise.all(pending);
+}
+
 export async function updateQuality(
   room: Room,
   tracks: PublishedTracks,

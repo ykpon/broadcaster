@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { Room, RoomEvent, ConnectionState, Track } from "livekit-client";
 import {
   Monitor,
   Check,
@@ -19,7 +18,7 @@ import {
 } from "lucide-react";
 import { Header, ErrorBox, CopyButton, Scene } from "./shared";
 import { useRoomInfo, roomStateLabel } from "./room";
-import { api, message, type Connection } from "./api";
+import { api, message } from "./api";
 import {
   RESOLUTION_STEPS,
   SETTING_RANGES,
@@ -28,14 +27,15 @@ import {
   qualityBalanceLabel,
   type StreamSettings,
 } from "./quality";
+import { applyQuality, displayCaptureOptions } from "./media";
+import { createControlSocket, type ControlSocket } from "./controlSocket";
+import type { StartResponse } from "./protocol";
 import {
-  applyQuality,
-  displayCaptureOptions,
-  publishScreen,
-  updateQuality,
-  type QualityUpdateResult,
-  type PublishedTracks,
-} from "./media";
+  createLiveKitPublisher,
+  type PublisherQualityUpdateResult,
+  type StudioPublisher,
+  type RTCStatsProvider,
+} from "./studioTransport";
 import {
   formatLimitation,
   formatMetric,
@@ -81,16 +81,17 @@ export default function Studio({ id }: { id: string }) {
     [muted, setMuted] = useState(false),
     [hasAudio, setHasAudio] = useState(false),
     [surface, setSurface] = useState(""),
-    [state, setState] = useState(ConnectionState.Disconnected),
+    [state, setState] = useState("disconnected"),
     [captureVideo, setCaptureVideo] = useState(""),
     [captureAudio, setCaptureAudio] = useState(""),
     [videoMetrics, setVideoMetrics] = useState<StreamMetrics>({}),
     [audioMetrics, setAudioMetrics] = useState<StreamMetrics>({}),
     [elapsed, setElapsed] = useState(0);
-  const roomRef = useRef<Room | null>(null),
+  const publisherRef = useRef<StudioPublisher | null>(null),
+    controlRef = useRef<ControlSocket | null>(null),
+    generationRef = useRef<number | null>(null),
     streamRef = useRef<MediaStream | null>(null),
     confirmedSettings = useRef(settings),
-    tracksRef = useRef<PublishedTracks | null>(null),
     preview = useRef<HTMLVideoElement>(null),
     started = useRef(0),
     ending = useRef(false),
@@ -99,36 +100,27 @@ export default function Studio({ id }: { id: string }) {
     previousAudioSample = useRef<CounterSample | undefined>(undefined),
     mounted = useRef(true);
   const statsSessionGuard = useRef(
-    createStatsSessionGuard<object | undefined>(),
+    createStatsSessionGuard<RTCStatsProvider | undefined>(),
   ).current;
   const [settingsUpdater] = useState(() =>
-    createLatestSettingsUpdater<StreamSettings, QualityUpdateResult>({
+    createLatestSettingsUpdater<StreamSettings, PublisherQualityUpdateResult>({
       apply: (next) => {
-        const room = roomRef.current;
-        const tracks = tracksRef.current;
-        if (!room || !tracks) return Promise.reject(new Error("Эфир завершён"));
-        return updateQuality(room, tracks, confirmedSettings.current, next);
+        const publisher = publisherRef.current;
+        if (!publisher) return Promise.reject(new Error("Эфир завершён"));
+        return publisher.updateSettings(confirmedSettings.current, next);
       },
       rollback: (confirmed, failed) => {
-        const room = roomRef.current;
-        const tracks = tracksRef.current;
-        if (!room || !tracks) return Promise.resolve();
-        return updateQuality(room, tracks, failed, confirmed);
+        const publisher = publisherRef.current;
+        if (!publisher) return Promise.resolve();
+        return publisher.updateSettings(failed, confirmed);
       },
       readConfirmed: () => confirmedSettings.current,
       equals: sameSettings,
       onBusy: setQualityBusy,
       onStart: () => setError(""),
-      onApplied: (next, result) => {
-        tracksRef.current = result.tracks;
-        if (result.videoRepublished) resetStats();
+      onApplied: (next) => {
         confirmedSettings.current = next;
         setAppliedSettings(next);
-      },
-      onRolledBack: (_confirmed, result) => {
-        if (!result) return;
-        tracksRef.current = result.tracks;
-        if (result.videoRepublished) resetStats();
       },
       onSuccess: (_next, result) => setNote(result.note),
       onFailure: (failure, confirmed, shouldRestoreDraft) => {
@@ -162,7 +154,9 @@ export default function Studio({ id }: { id: string }) {
         t.onended = null;
         t.stop();
       });
-      void roomRef.current?.disconnect();
+      controlRef.current?.close();
+      void publisherRef.current?.stop();
+      publisherRef.current = null;
     };
   }, []);
   useEffect(() => {
@@ -173,13 +167,15 @@ export default function Studio({ id }: { id: string }) {
       settingsUpdater.cancel();
       setEnded(true);
       setLive(false);
-      tracksRef.current = null;
       resetDiagnostics();
       streamRef.current?.getTracks().forEach((t) => {
         t.onended = null;
         t.stop();
       });
-      void roomRef.current?.disconnect();
+      controlRef.current?.close();
+      controlRef.current = null;
+      void publisherRef.current?.stop();
+      publisherRef.current = null;
     }
   }, [info?.state]);
   useEffect(() => {
@@ -198,18 +194,24 @@ export default function Studio({ id }: { id: string }) {
           `${audioCapture.sampleRate ? `${audioCapture.sampleRate / 1000} кГц` : "—"} · ${audioCapture.channelCount === 2 ? "стерео" : audioCapture.channelCount ? "моно" : "—"}`,
         );
 
-      const tracks = tracksRef.current;
-      if (!tracks) return;
-      const videoRead = statsSessionGuard.capture(tracks.video);
+      const sources = publisherRef.current?.getStatsSources();
+      if (!sources?.video) return;
+      const video = sources.video;
+      const videoRead = statsSessionGuard.capture(video);
       if (videoRead)
-        void tracks.video
-          .getRTCStatsReport()
+        void video
+          .getStats()
           .then((report) => {
             if (!report || !mounted.current) {
               statsSessionGuard.release(videoRead);
               return;
             }
-            if (!statsSessionGuard.commit(videoRead, tracksRef.current?.video))
+            if (
+              !statsSessionGuard.commit(
+                videoRead,
+                publisherRef.current?.getStatsSources().video,
+              )
+            )
               return;
             const parsed = parseOutboundStats(
               Array.from(report.values()),
@@ -219,19 +221,22 @@ export default function Studio({ id }: { id: string }) {
             setVideoMetrics(parsed.metrics);
           })
           .catch(() => statsSessionGuard.release(videoRead));
-      if (tracks.audio) {
-        const audio = tracks.audio;
+      if (sources.audio) {
+        const audio = sources.audio;
         const audioRead = statsSessionGuard.capture(audio);
         if (audioRead)
           void audio
-            .getRTCStatsReport()
+            .getStats()
             .then((report) => {
               if (!report || !mounted.current) {
                 statsSessionGuard.release(audioRead);
                 return;
               }
               if (
-                !statsSessionGuard.commit(audioRead, tracksRef.current?.audio)
+                !statsSessionGuard.commit(
+                  audioRead,
+                  publisherRef.current?.getStatsSources().audio,
+                )
               )
                 return;
               const parsed = parseOutboundStats(
@@ -249,48 +254,44 @@ export default function Studio({ id }: { id: string }) {
   async function stopPublishing() {
     setLive(false);
     await settingsUpdater.settleAndCancel();
-    const room = roomRef.current;
-    const tracks = tracksRef.current;
+    const publisher = publisherRef.current;
+    publisherRef.current = null;
+    const control = controlRef.current;
+    controlRef.current = null;
     const stream = streamRef.current;
-    tracksRef.current = null;
     streamRef.current = null;
     resetDiagnostics();
+    control?.close();
     stream?.getTracks().forEach((t) => {
       t.onended = null;
     });
     try {
-      if (room && tracks) {
-        const unpublished: Promise<unknown>[] = [];
-        if (room.localParticipant.getTrackPublication(Track.Source.ScreenShare))
-          unpublished.push(
-            room.localParticipant.unpublishTrack(tracks.video, false),
-          );
-        if (
-          tracks.audio &&
-          room.localParticipant.getTrackPublication(
-            Track.Source.ScreenShareAudio,
-          )
-        )
-          unpublished.push(
-            room.localParticipant.unpublishTrack(tracks.audio, false),
-          );
-        await Promise.all(unpublished);
-      }
+      await publisher?.stop();
     } finally {
       stream?.getTracks().forEach((t) => t.stop());
       if (preview.current) preview.current.srcObject = null;
+      setState("disconnected");
     }
   }
   async function pause() {
-    if (ending.current || stopping.current || !tracksRef.current) return;
+    if (ending.current || stopping.current || !publisherRef.current) return;
     stopping.current = true;
     setBusy(true);
     setError("");
+    const generation = generationRef.current;
     try {
       await stopPublishing();
     } catch (e) {
       setError(message(e));
     } finally {
+      if (generation !== null) {
+        try {
+          await api(`/rooms/${id}/stop`, { hostSecret: secret, generation });
+        } catch (e) {
+          setError(message(e));
+        }
+      }
+      generationRef.current = null;
       stopping.current = false;
       setBusy(false);
     }
@@ -300,8 +301,7 @@ export default function Studio({ id }: { id: string }) {
     ending.current = true;
     setBusy(true);
     await stopPublishing().catch(() => {});
-    await roomRef.current?.disconnect();
-    roomRef.current = null;
+    generationRef.current = null;
     try {
       await api(`/rooms/${id}/end`, { hostSecret: secret });
       setEnded(true);
@@ -313,15 +313,15 @@ export default function Studio({ id }: { id: string }) {
     }
   }
   async function start() {
+    if (busy || publisherRef.current || ending.current || stopping.current)
+      return;
     settingsUpdater.cancel();
     setError("");
     setNote("");
     setBusy(true);
-    tracksRef.current = null;
     resetDiagnostics();
     let stream: MediaStream | null = null;
-    let room = roomRef.current;
-    let connectedHere = false;
+    let response: StartResponse | null = null;
     try {
       if (!secret)
         throw new Error(
@@ -341,38 +341,97 @@ export default function Studio({ id }: { id: string }) {
       }
       setNote(await applyQuality(stream.getVideoTracks()[0], settings));
       streamRef.current = stream;
-      if (!room || room.state !== ConnectionState.Connected) {
-        const auth = await api<Connection>(`/rooms/${id}/host-token`, {
-          hostSecret: secret,
-        });
-        room = new Room({ adaptiveStream: false, dynacast: false });
-        roomRef.current = room;
-        room.on(RoomEvent.ConnectionStateChanged, setState);
-        room.on(RoomEvent.Disconnected, () => {
-          if (!ending.current && mounted.current && roomRef.current === room) {
-            settingsUpdater.cancel();
-            streamRef.current?.getTracks().forEach((t) => {
-              t.onended = null;
-              t.stop();
-            });
-            roomRef.current = null;
-            setLive(false);
-            tracksRef.current = null;
-            resetDiagnostics();
-            setError(
-              "Соединение прервано. Повторите запуск; убедитесь, что студия не открыта в другой вкладке.",
-            );
-          }
-        });
-        await room.connect(auth.url, auth.token);
-        connectedHere = true;
-      }
+      response = await api<StartResponse>(`/rooms/${id}/start`, {
+        hostSecret: secret,
+        transport: "server",
+        viewerLimit: "10",
+      });
+      if (response.transport !== "server")
+        throw new Error("Сервер выбрал неожиданный режим трансляции");
+      generationRef.current = response.generation;
       if (!mounted.current) {
-        if (connectedHere) await room.disconnect();
+        await api(`/rooms/${id}/stop`, {
+          hostSecret: secret,
+          generation: response.generation,
+        }).catch(() => {});
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
-      tracksRef.current = await publishScreen(room, stream, settings);
+      const generation = response.generation;
+      let published = false;
+      let statsVideo: RTCStatsProvider | undefined;
+      const publisher = createLiveKitPublisher({
+        onConnectionState: (current, next) => {
+          if (
+            mounted.current &&
+            publisherRef.current === publisher &&
+            current === generation
+          )
+            setState(next);
+        },
+        onDisconnected: (current) => {
+          if (
+            !published ||
+            !mounted.current ||
+            publisherRef.current !== publisher ||
+            current !== generation ||
+            ending.current ||
+            stopping.current
+          )
+            return;
+          void pause().then(() => {
+            if (mounted.current && !publisherRef.current)
+              setError(
+                "Соединение прервано. Повторите запуск; убедитесь, что студия не открыта в другой вкладке.",
+              );
+          });
+        },
+        onPublishedTracksChanged: (current, sources) => {
+          if (publisherRef.current !== publisher || current !== generation)
+            return;
+          if (statsVideo && statsVideo !== sources.video) resetStats();
+          statsVideo = sources.video;
+        },
+      });
+      publisherRef.current = publisher;
+      const control = createControlSocket({
+        roomId: id,
+        getTicket: async () =>
+          (
+            await api<{ ticket: string }>(`/rooms/${id}/signal-ticket`, {
+              hostSecret: secret,
+              generation,
+            })
+          ).ticket,
+        onSignal: (signal) => {
+          if (
+            publisherRef.current !== publisher ||
+            generationRef.current !== generation
+          )
+            return;
+          if (signal.type === "room-ended") void stopPublishing();
+        },
+        onFatal: (failure) => {
+          if (publisherRef.current === publisher && mounted.current) {
+            void pause().then(() => {
+              if (mounted.current && !publisherRef.current)
+                setError(message(failure));
+            });
+          }
+        },
+      });
+      controlRef.current = control;
+      control.connect(response.ticket);
+      await publisher.start({
+        generation,
+        stream,
+        settings,
+        livekit: response.livekit,
+        send: control.send,
+      });
+      if (!mounted.current || publisherRef.current !== publisher) return;
+      published = true;
+      control.send({ type: "broadcast-ready", generation });
       confirmedSettings.current = settings;
       setAppliedSettings(settings);
       setHasAudio(stream.getAudioTracks().length > 0);
@@ -391,22 +450,22 @@ export default function Studio({ id }: { id: string }) {
       }
     } catch (e) {
       settingsUpdater.cancel();
-      tracksRef.current = null;
-      resetDiagnostics();
-      stream?.getTracks().forEach((t) => t.stop());
-      if (connectedHere) {
-        await room?.disconnect();
-        if (roomRef.current === room) roomRef.current = null;
+      await stopPublishing().catch(() => {});
+      if (response) {
+        await api(`/rooms/${id}/stop`, {
+          hostSecret: secret,
+          generation: response.generation,
+        }).catch(() => {});
       }
-      setError(captureError(e));
+      generationRef.current = null;
+      if (mounted.current) setError(captureError(e));
     } finally {
       setBusy(false);
     }
   }
   function commitSettings(next: StreamSettings) {
     setSettings(next);
-    const tracks = tracksRef.current;
-    if (stopping.current || !tracks || !live) {
+    if (stopping.current || !publisherRef.current || !live) {
       confirmedSettings.current = next;
       return;
     }
@@ -799,10 +858,18 @@ export default function Studio({ id }: { id: string }) {
                   }
                   disabled={!live || !hasAudio}
                   onClick={() => {
-                    streamRef.current?.getAudioTracks().forEach((t) => {
-                      t.enabled = muted;
-                    });
-                    setMuted(!muted);
+                    const publisher = publisherRef.current;
+                    if (!publisher) return;
+                    const next = !muted;
+                    void publisher
+                      .setMuted(next)
+                      .then(() => {
+                        if (publisherRef.current === publisher) setMuted(next);
+                      })
+                      .catch((failure) => {
+                        if (publisherRef.current === publisher)
+                          setError(message(failure));
+                      });
                   }}
                 >
                   {muted || !hasAudio ? (

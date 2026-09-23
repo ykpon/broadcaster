@@ -101,7 +101,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rooms/{id}/join", s.join)
 	mux.HandleFunc("POST /api/rooms/{id}/signal-ticket", s.signalTicket)
 	mux.HandleFunc("GET /api/rooms/{id}/signal", s.signal)
-	mux.HandleFunc("POST /api/rooms/{id}/host-token", s.host)
 	mux.HandleFunc("POST /api/rooms/{id}/viewer-token", s.viewer)
 	mux.HandleFunc("POST /api/rooms/{id}/end", s.end)
 	mux.HandleFunc("GET /api/", func(w http.ResponseWriter, r *http.Request) { problem(w, 404, "Маршрут не найден") })
@@ -239,8 +238,8 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		s.mu.Unlock()
 		return StartResponse{}, 409, "Эфир уже запущен"
 	}
-	// Legacy requests were authorized by ensureLegacyServer; its viewer adapter
-	// also intentionally permits the initial anonymous server generation.
+	// The legacy viewer adapter intentionally permits the initial anonymous
+	// server generation until Viewer migrates to /join.
 	if !legacy {
 		hash := sha256.Sum256([]byte(secret))
 		if subtle.ConstantTimeCompare(hash[:], room.Secret[:]) != 1 {
@@ -304,7 +303,7 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 	return response, 200, ""
 }
 
-func (s *Server) ensureLegacyServer(ctx context.Context, id, secret string, authenticated bool) (int, string) {
+func (s *Server) ensureLegacyServer(ctx context.Context, id string) (int, string) {
 	s.mu.Lock()
 	room := s.rooms[id]
 	if room == nil {
@@ -314,13 +313,6 @@ func (s *Server) ensureLegacyServer(ctx context.Context, id, secret string, auth
 	if room.State == "ended" {
 		s.mu.Unlock()
 		return 410, "Эфир завершён"
-	}
-	if authenticated {
-		hash := sha256.Sum256([]byte(secret))
-		if subtle.ConstantTimeCompare(hash[:], room.Secret[:]) != 1 {
-			s.mu.Unlock()
-			return 403, "Нужна ссылка ведущего с ключом доступа"
-		}
 	}
 	if room.Generation != 0 {
 		if room.Transport != TransportServer || room.MediaRoom == "" {
@@ -332,7 +324,7 @@ func (s *Server) ensureLegacyServer(ctx context.Context, id, secret string, auth
 	}
 	s.mu.Unlock()
 	limit, _ := ParseViewerLimit("10")
-	_, code, message := s.startRoom(ctx, id, secret, TransportServer, limit, true)
+	_, code, message := s.startRoom(ctx, id, "", TransportServer, limit, true)
 	return code, message
 }
 
@@ -372,29 +364,8 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"state": "waiting", "generation": input.Generation})
 }
 
-func (s *Server) host(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		HostSecret string `json:"hostSecret"`
-	}
-	if decode(w, r, &input) != nil {
-		problem(w, 400, "Некорректный запрос")
-		return
-	}
-	if code, message := s.ensureLegacyServer(r.Context(), r.PathValue("id"), input.HostSecret, true); code != 200 {
-		problem(w, code, message)
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	room := s.lookup(w, r, true)
-	if room == nil {
-		return
-	}
-	// A fixed identity enforces one publisher per room on the SFU.
-	writeJSON(w, 200, map[string]string{"token": s.media.Token(room.MediaRoom, "host", true), "url": s.MediaURL})
-}
 func (s *Server) viewer(w http.ResponseWriter, r *http.Request) {
-	if code, message := s.ensureLegacyServer(r.Context(), r.PathValue("id"), "", false); code != 200 {
+	if code, message := s.ensureLegacyServer(r.Context(), r.PathValue("id")); code != 200 {
 		problem(w, code, message)
 		return
 	}
