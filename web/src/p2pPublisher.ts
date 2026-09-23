@@ -4,7 +4,7 @@ import {
   type CounterSample,
   type StreamMetrics,
 } from "./stats";
-import type { ServerSignal } from "./protocol";
+import type { ICECandidate, ServerSignal } from "./protocol";
 import {
   applyAudioSenderSettings,
   applyQuality,
@@ -26,12 +26,16 @@ export type P2PSignaling = {
 
 type PeerState = {
   connection: RTCPeerConnection;
+  negotiationId: string;
   timer: ReturnType<typeof setTimeout>;
   videoSender?: RTCRtpSender;
   audioSender?: RTCRtpSender;
   videoSample?: CounterSample;
   audioSample?: CounterSample;
   connected: boolean;
+  remoteDescriptionSet: boolean;
+  drainingCandidates: boolean;
+  pendingCandidates: ICECandidate[];
 };
 
 type PeerConnectionConstructor = new (
@@ -41,11 +45,13 @@ type PeerConnectionConstructor = new (
 type P2PDependencies = {
   RTCPeerConnection: PeerConnectionConstructor;
   getSenderCapabilities(kind: "video"): RTCRtpCapabilities | null;
+  createNegotiationId(): string;
 };
 
 const defaultDependencies: P2PDependencies = {
   RTCPeerConnection: globalThis.RTCPeerConnection,
   getSenderCapabilities: (kind) => RTCRtpSender.getCapabilities(kind),
+  createNegotiationId: () => globalThis.crypto.randomUUID(),
 };
 
 function preferredCodecs(
@@ -68,6 +74,7 @@ export function createP2PPublisher(
   dependencies: P2PDependencies = defaultDependencies,
 ): StudioPublisher & P2PSignaling {
   const peers = new Map<string, PeerState>();
+  const peerRequests = new Map<string, object>();
   const failedViewers = new Set<string>();
   let startInput: PublisherStart | undefined;
   let settings: StreamSettings | undefined;
@@ -140,24 +147,33 @@ export function createP2PPublisher(
       type: "peer-failed",
       generation: startInput.generation,
       viewer,
+      negotiationId: state.negotiationId,
     });
     notifyCounts();
   };
 
-  const createPeer = async (viewer: string) => {
+  const createPeer = async (viewer: string, request: object) => {
     const requestedInput = startInput;
     await qualityUpdate?.catch(() => {});
     const input = startInput;
     const currentSettings = settings;
-    if (!input || input !== requestedInput || stopPromise || !currentSettings)
+    if (
+      !input ||
+      input !== requestedInput ||
+      stopPromise ||
+      !currentSettings ||
+      peerRequests.get(viewer) !== request
+    )
       return;
 
+    peerRequests.delete(viewer);
     closePeer(viewer);
     failedViewers.delete(viewer);
 
     const connection = new dependencies.RTCPeerConnection({
       iceServers: input.iceServers ?? [],
     });
+    const negotiationId = dependencies.createNegotiationId();
     const videoTrack = input.stream.getVideoTracks()[0];
     const audioTrack = input.stream.getAudioTracks()[0];
     const videoTransceiver = videoTrack
@@ -181,10 +197,14 @@ export function createP2PPublisher(
 
     const state: PeerState = {
       connection,
+      negotiationId,
       timer: setTimeout(() => failPeer(viewer, state), PEER_TIMEOUT_MS),
       videoSender: videoTransceiver?.sender,
       audioSender: audioTransceiver?.sender,
       connected: false,
+      remoteDescriptionSet: false,
+      drainingCandidates: false,
+      pendingCandidates: [],
     };
     peers.set(viewer, state);
     notifyCounts();
@@ -221,12 +241,20 @@ export function createP2PPublisher(
         type: "ice-candidate",
         generation: current.generation,
         viewer,
+        negotiationId,
         candidate,
       });
     };
 
     const handleConnectionState = () => {
       if (stopPromise || peers.get(viewer) !== state) return;
+      if (
+        connection.connectionState === "failed" ||
+        connection.iceConnectionState === "failed"
+      ) {
+        failPeer(viewer, state);
+        return;
+      }
       if (
         connection.connectionState === "connected" ||
         connection.iceConnectionState === "connected" ||
@@ -239,11 +267,6 @@ export function createP2PPublisher(
         }
         return;
       }
-      if (
-        connection.connectionState === "failed" ||
-        connection.iceConnectionState === "failed"
-      )
-        failPeer(viewer, state);
     };
     connection.onconnectionstatechange = handleConnectionState;
     connection.oniceconnectionstatechange = handleConnectionState;
@@ -265,6 +288,7 @@ export function createP2PPublisher(
         type: "offer",
         generation: input.generation,
         viewer,
+        negotiationId,
         sdp: offer.sdp ?? "",
       });
     } catch {
@@ -292,10 +316,13 @@ export function createP2PPublisher(
       )
         return;
       if (signal.type === "peer-ready") {
-        await createPeer(signal.viewer);
+        const request = {};
+        peerRequests.set(signal.viewer, request);
+        await createPeer(signal.viewer, request);
         return;
       }
       if (signal.type === "peer-left") {
+        peerRequests.delete(signal.viewer);
         const closed = closePeer(signal.viewer);
         const wasFailed = failedViewers.delete(signal.viewer);
         if (closed || wasFailed) notifyCounts();
@@ -304,16 +331,44 @@ export function createP2PPublisher(
       if (signal.type !== "answer" && signal.type !== "ice-candidate") return;
       const state = peers.get(signal.viewer);
       if (!state) return;
+      if (
+        !("negotiationId" in signal) ||
+        signal.negotiationId !== state.negotiationId
+      )
+        return;
       try {
         if (signal.type === "answer") {
           await state.connection.setRemoteDescription({
             type: "answer",
             sdp: signal.sdp,
           });
+          if (
+            startInput !== input ||
+            stopPromise ||
+            peers.get(signal.viewer) !== state
+          )
+            return;
+          state.remoteDescriptionSet = true;
+          state.drainingCandidates = true;
+          while (state.pendingCandidates.length > 0) {
+            const candidate = state.pendingCandidates.shift()!;
+            await state.connection.addIceCandidate(candidate);
+            if (
+              startInput !== input ||
+              stopPromise ||
+              peers.get(signal.viewer) !== state
+            )
+              return;
+          }
+          state.drainingCandidates = false;
           return;
         }
         if (signal.type === "ice-candidate") {
           const candidate = signal.candidate;
+          if (!state.remoteDescriptionSet || state.drainingCandidates) {
+            state.pendingCandidates.push(candidate);
+            return;
+          }
           await state.connection.addIceCandidate(candidate);
         }
       } catch {
@@ -375,6 +430,7 @@ export function createP2PPublisher(
       if (stopPromise) return stopPromise;
       if (!startInput) return Promise.resolve();
       const input = startInput;
+      peerRequests.clear();
       const operation = (async () => {
         await qualityUpdate?.catch(() => {});
         if (startInput === input) {

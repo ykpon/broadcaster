@@ -87,6 +87,7 @@ function fixture() {
   } as unknown as MediaStream;
   const send = vi.fn();
   const counts = vi.fn();
+  let attempt = 0;
   const publisher = createP2PPublisher(
     { onPeerCountsChanged: counts },
     {
@@ -95,6 +96,7 @@ function fixture() {
         ({
           codecs: FakePeer.codecCapabilities,
         }) as unknown as RTCRtpCapabilities,
+      createNegotiationId: () => `attempt-${++attempt}`,
     },
   );
   const start = () =>
@@ -157,6 +159,7 @@ describe("P2P publisher lifecycle", () => {
       type: "offer",
       generation: 7,
       viewer: "viewer-a",
+      negotiationId: "attempt-1",
       sdp: "offer-sdp",
     });
     expect(peer.localDescription).toEqual({ type: "offer", sdp: "offer-sdp" });
@@ -183,12 +186,14 @@ describe("P2P publisher lifecycle", () => {
       type: "answer",
       generation: 6,
       viewer: "viewer-a",
+      negotiationId: "attempt-1",
       sdp: "stale",
     });
     await publisher.handleSignal({
       type: "answer",
       generation: 7,
       viewer: "unknown",
+      negotiationId: "attempt-2",
       sdp: "stranger",
     });
     expect(current.setRemoteDescription).not.toHaveBeenCalled();
@@ -196,12 +201,36 @@ describe("P2P publisher lifecycle", () => {
       type: "answer",
       generation: 7,
       viewer: "viewer-a",
+      negotiationId: "attempt-1",
+      sdp: "delayed-answer",
+    });
+    await publisher.handleSignal({
+      type: "ice-candidate",
+      generation: 7,
+      viewer: "viewer-a",
+      negotiationId: "attempt-1",
+      candidate: { candidate: "delayed-candidate" },
+    });
+    await publisher.handleSignal({
+      type: "answer",
+      generation: 7,
+      viewer: "viewer-a",
+      sdp: "missing-attempt",
+    } as Parameters<typeof publisher.handleSignal>[0]);
+    expect(current.setRemoteDescription).not.toHaveBeenCalled();
+    expect(current.addIceCandidate).not.toHaveBeenCalled();
+    await publisher.handleSignal({
+      type: "answer",
+      generation: 7,
+      viewer: "viewer-a",
+      negotiationId: "attempt-2",
       sdp: "answer-sdp",
     });
     await publisher.handleSignal({
       type: "ice-candidate",
       generation: 7,
       viewer: "viewer-a",
+      negotiationId: "attempt-2",
       candidate: { candidate: "remote" },
     });
     expect(current.setRemoteDescription).toHaveBeenCalledWith({
@@ -227,8 +256,76 @@ describe("P2P publisher lifecycle", () => {
       type: "ice-candidate",
       generation: 7,
       viewer: "viewer-a",
+      negotiationId: "attempt-2",
       candidate: { candidate: "local" },
     });
+    await publisher.stop();
+  });
+
+  it("queues remote ICE until the matching answer is installed and drains in order", async () => {
+    const { publisher, start } = fixture();
+    await start();
+    await publisher.handleSignal({
+      type: "peer-ready",
+      generation: 7,
+      viewer: "a",
+    });
+    const peer = FakePeer.instances[0];
+
+    await publisher.handleSignal({
+      type: "ice-candidate",
+      generation: 7,
+      viewer: "a",
+      negotiationId: "attempt-1",
+      candidate: { candidate: "first" },
+    });
+    await publisher.handleSignal({
+      type: "ice-candidate",
+      generation: 7,
+      viewer: "a",
+      negotiationId: "attempt-1",
+      candidate: { candidate: "second" },
+    });
+    expect(peer.addIceCandidate).not.toHaveBeenCalled();
+    expect(peer.close).not.toHaveBeenCalled();
+
+    let releaseFirst: (() => void) | undefined;
+    const firstPending = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    peer.addIceCandidate.mockImplementationOnce(() => firstPending);
+    const answering = publisher.handleSignal({
+      type: "answer",
+      generation: 7,
+      viewer: "a",
+      negotiationId: "attempt-1",
+      sdp: "answer-sdp",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(peer.addIceCandidate).toHaveBeenCalledOnce();
+    await publisher.handleSignal({
+      type: "ice-candidate",
+      generation: 7,
+      viewer: "a",
+      negotiationId: "attempt-1",
+      candidate: { candidate: "third" },
+    });
+    expect(peer.addIceCandidate).toHaveBeenCalledOnce();
+    releaseFirst?.();
+    await answering;
+    expect(peer.setRemoteDescription).toHaveBeenCalledWith({
+      type: "answer",
+      sdp: "answer-sdp",
+    });
+    expect(peer.addIceCandidate.mock.calls).toEqual([
+      [{ candidate: "first" }],
+      [{ candidate: "second" }],
+      [{ candidate: "third" }],
+    ]);
+    expect(peer.setRemoteDescription.mock.invocationCallOrder[0]).toBeLessThan(
+      peer.addIceCandidate.mock.invocationCallOrder[0],
+    );
     await publisher.stop();
   });
 
@@ -253,6 +350,7 @@ describe("P2P publisher lifecycle", () => {
       type: "peer-failed",
       generation: 7,
       viewer: "a",
+      negotiationId: "attempt-1",
     });
     expect(counts).toHaveBeenCalledWith(7, 1, 1);
     await publisher.handleSignal({
@@ -300,6 +398,30 @@ describe("P2P publisher lifecycle", () => {
       type: "peer-failed",
       generation: 7,
       viewer: "a",
+      negotiationId: "attempt-1",
+    });
+    await publisher.stop();
+  });
+
+  it("treats a failed DTLS connection as failure even when ICE is connected", async () => {
+    const { publisher, start, send } = fixture();
+    await start();
+    await publisher.handleSignal({
+      type: "peer-ready",
+      generation: 7,
+      viewer: "a",
+    });
+    const peer = FakePeer.instances[0];
+    peer.connectionState = "failed";
+    peer.iceConnectionState = "connected";
+    peer.onconnectionstatechange?.();
+
+    expect(peer.close).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledWith({
+      type: "peer-failed",
+      generation: 7,
+      viewer: "a",
+      negotiationId: "attempt-1",
     });
     await publisher.stop();
   });
@@ -352,7 +474,18 @@ describe("P2P publisher lifecycle", () => {
         type: "ice-candidate",
         generation: 7,
         viewer: "a",
+        negotiationId: "attempt-1",
         candidate: { candidate: "invalid" },
+      }),
+    ).resolves.toBeUndefined();
+    expect(failed.close).not.toHaveBeenCalled();
+    await expect(
+      publisher.handleSignal({
+        type: "answer",
+        generation: 7,
+        viewer: "a",
+        negotiationId: "attempt-1",
+        sdp: "answer-sdp",
       }),
     ).resolves.toBeUndefined();
     expect(failed.close).toHaveBeenCalledOnce();
@@ -361,6 +494,7 @@ describe("P2P publisher lifecycle", () => {
       type: "peer-failed",
       generation: 7,
       viewer: "a",
+      negotiationId: "attempt-1",
     });
     await publisher.stop();
   });
@@ -525,6 +659,57 @@ describe("P2P sender quality", () => {
     release?.();
     await Promise.all([updating, stopping]);
     await expect(start()).resolves.toBeUndefined();
+    await publisher.stop();
+  });
+
+  it("invalidates departed and superseded peer requests while quality is updating", async () => {
+    const { publisher, start, send, video } = fixture();
+    await start();
+    let release: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    (video.applyConstraints as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => pending,
+    );
+    const previous = { ...DEFAULT_STREAM_SETTINGS, codec: "av1" as const };
+    const updating = publisher.updateSettings(previous, {
+      ...previous,
+      videoBitrateMbps: 42,
+    });
+    const departed = publisher.handleSignal({
+      type: "peer-ready",
+      generation: 7,
+      viewer: "departed",
+    });
+    await publisher.handleSignal({
+      type: "peer-left",
+      generation: 7,
+      viewer: "departed",
+    });
+    const superseded = publisher.handleSignal({
+      type: "peer-ready",
+      generation: 7,
+      viewer: "current",
+    });
+    const current = publisher.handleSignal({
+      type: "peer-ready",
+      generation: 7,
+      viewer: "current",
+    });
+
+    release?.();
+    await Promise.all([updating, departed, superseded, current]);
+
+    expect(FakePeer.instances).toHaveLength(1);
+    expect(send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ viewer: "departed" }),
+    );
+    expect(
+      send.mock.calls.filter(
+        ([signal]) => signal.type === "offer" && signal.viewer === "current",
+      ),
+    ).toHaveLength(1);
     await publisher.stop();
   });
 });

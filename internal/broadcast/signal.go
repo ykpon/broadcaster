@@ -483,7 +483,7 @@ func (s *Server) routeSignal(id string, p *signalPeer, message clientSignal) boo
 		}
 	}
 	if target != nil {
-		target.send(serverSignal{Type: message.Type, Generation: room.Generation, Viewer: viewer, SDP: message.SDP, Candidate: message.Candidate})
+		target.send(serverSignal{Type: message.Type, Generation: room.Generation, Viewer: viewer, NegotiationID: message.NegotiationID, SDP: message.SDP, Candidate: message.Candidate})
 	}
 	return true
 }

@@ -69,15 +69,22 @@ export type ServerSignal =
       type: "offer" | "answer";
       generation: number;
       viewer: string;
+      negotiationId: string;
       sdp: string;
     }
   | {
       type: "ice-candidate";
       generation: number;
       viewer: string;
+      negotiationId: string;
       candidate: ICECandidate;
     }
-  | { type: "peer-failed"; generation: number; viewer: string }
+  | {
+      type: "peer-failed";
+      generation: number;
+      viewer: string;
+      negotiationId?: string;
+    }
   | { type: "error"; generation?: number; error: string };
 
 export type ClientSignal =
@@ -87,18 +94,26 @@ export type ClientSignal =
       type: "offer" | "answer";
       generation: number;
       viewer?: string;
+      negotiationId: string;
       sdp: string;
     }
   | {
       type: "ice-candidate";
       generation: number;
       viewer?: string;
+      negotiationId: string;
       candidate: ICECandidate;
     }
   | {
-      type: "peer-ready" | "peer-failed";
+      type: "peer-ready";
       generation: number;
       viewer?: string;
+    }
+  | {
+      type: "peer-failed";
+      generation: number;
+      viewer?: string;
+      negotiationId?: string;
     };
 
 export type BroadcastConfig = {

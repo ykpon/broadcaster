@@ -254,16 +254,16 @@ func TestSignalRoutingAndGenerationIsolation(t *testing.T) {
 		t.Fatal(got)
 	}
 	sendSignal(t, h, clientSignal{Type: "offer", Generation: gen - 1, Viewer: viewerID, SDP: "stale"})
-	sendSignal(t, h, clientSignal{Type: "offer", Generation: gen, Viewer: viewerID, SDP: "offer-sdp"})
-	if got := readSignal(t, v, "offer"); got.Generation != 1 || got.SDP != "offer-sdp" {
+	sendSignal(t, h, clientSignal{Type: "offer", Generation: gen, Viewer: viewerID, NegotiationID: "attempt-1", SDP: "offer-sdp"})
+	if got := readSignal(t, v, "offer"); got.Generation != 1 || got.NegotiationID != "attempt-1" || got.SDP != "offer-sdp" {
 		t.Fatal(got)
 	}
-	sendSignal(t, v, clientSignal{Type: "answer", Generation: gen, SDP: "answer-sdp"})
-	if got := readSignal(t, h, "answer"); got.Viewer != viewerID || got.SDP != "answer-sdp" {
+	sendSignal(t, v, clientSignal{Type: "answer", Generation: gen, NegotiationID: "attempt-1", SDP: "answer-sdp"})
+	if got := readSignal(t, h, "answer"); got.Viewer != viewerID || got.NegotiationID != "attempt-1" || got.SDP != "answer-sdp" {
 		t.Fatal(got)
 	}
-	sendSignal(t, v, clientSignal{Type: "ice-candidate", Generation: gen, Candidate: &ICECandidate{Candidate: "candidate"}})
-	if got := readSignal(t, h, "ice-candidate"); got.Viewer != viewerID || got.Candidate.Candidate != "candidate" {
+	sendSignal(t, v, clientSignal{Type: "ice-candidate", Generation: gen, NegotiationID: "attempt-1", Candidate: &ICECandidate{Candidate: "candidate"}})
+	if got := readSignal(t, h, "ice-candidate"); got.Viewer != viewerID || got.NegotiationID != "attempt-1" || got.Candidate.Candidate != "candidate" {
 		t.Fatal(got)
 	}
 	sendSignal(t, h, clientSignal{Type: "broadcast-ready", Generation: gen - 1})
