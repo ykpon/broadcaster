@@ -4,6 +4,22 @@ import {
   saveStreamSettings,
   type StreamSettings,
 } from "./quality";
+import {
+  DEFAULT_BROADCAST_CONFIG,
+  loadBroadcastConfig,
+  normalizeViewerLimit,
+  saveBroadcastConfig,
+  type BroadcastConfig,
+  type StartResponse,
+  type TransportMode,
+} from "./protocol";
+import {
+  parseOutboundStats,
+  type CounterSample,
+  type StreamMetrics,
+} from "./stats";
+import type { RTCStatsProvider, StudioPublisher } from "./studioTransport";
+import type { ControlSocketSignal } from "./controlSocket";
 
 type StorageGetter = () => Storage;
 
@@ -26,6 +42,201 @@ export function saveStreamSettingsSafely(
   } catch {
     // Acquiring localStorage can itself throw in restricted browser contexts.
   }
+}
+
+export function loadBroadcastConfigSafely(
+  getStorage: StorageGetter,
+): BroadcastConfig {
+  try {
+    return loadBroadcastConfig(getStorage());
+  } catch {
+    return { ...DEFAULT_BROADCAST_CONFIG };
+  }
+}
+
+export function saveBroadcastConfigSafely(
+  getStorage: StorageGetter,
+  config: BroadcastConfig,
+): void {
+  try {
+    saveBroadcastConfig(getStorage(), config);
+  } catch {
+    // Acquiring localStorage can itself throw in restricted browser contexts.
+  }
+}
+
+type StudioControl = {
+  send(signal: ControlSocketSignal): void;
+  close(): void;
+};
+
+const CONTROL_AUTH_TIMEOUT_MS = 20_000;
+
+export type StartedStudioBroadcast = {
+  config: BroadcastConfig;
+  stream: MediaStream;
+  response: StartResponse;
+  publisher?: StudioPublisher;
+  control?: StudioControl;
+};
+
+export type StartStudioBroadcastOptions = {
+  transport?: TransportMode;
+  viewerLimit?: string;
+  capture(): Promise<MediaStream>;
+  prepareCapture?(stream: MediaStream): Promise<void>;
+  startGeneration(config: BroadcastConfig): Promise<StartResponse>;
+  createPublisher?(
+    transport: TransportMode,
+    response: StartResponse,
+  ): StudioPublisher;
+  connectControl?(input: {
+    response: StartResponse;
+    publisher: StudioPublisher;
+  }): { control: StudioControl; authenticated: Promise<void> };
+  stopGeneration?(generation: number): Promise<void>;
+  settings?: StreamSettings;
+  isCurrent?(): boolean;
+  schedule?(callback: () => void, delay: number): unknown;
+  cancelScheduled?(timer: unknown): void;
+};
+
+class StaleStudioStart extends Error {}
+
+function stopTracks(stream: MediaStream | undefined) {
+  stream?.getTracks().forEach((track) => track.stop());
+}
+
+export async function startStudioBroadcast(
+  options: StartStudioBroadcastOptions,
+): Promise<StartedStudioBroadcast | null> {
+  const transport = options.transport ?? DEFAULT_BROADCAST_CONFIG.transport;
+  const viewerLimit = normalizeViewerLimit(
+    options.viewerLimit ?? DEFAULT_BROADCAST_CONFIG.viewerLimit,
+  );
+  if (viewerLimit === null)
+    throw new Error("Лимит зрителей должен быть положительным целым числом.");
+
+  const config = { transport, viewerLimit } satisfies BroadcastConfig;
+  let stream: MediaStream;
+  try {
+    stream = await options.capture();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError")
+      return null;
+    throw error;
+  }
+
+  let response: StartResponse | undefined;
+  let publisher: StudioPublisher | undefined;
+  let control: StudioControl | undefined;
+  const ensureCurrent = () => {
+    if (options.isCurrent && !options.isCurrent()) throw new StaleStudioStart();
+  };
+  const cleanup = async () => {
+    control?.close();
+    await publisher?.stop().catch(() => {});
+    stopTracks(stream);
+    if (response && options.stopGeneration)
+      await options.stopGeneration(response.generation).catch(() => {});
+  };
+
+  try {
+    ensureCurrent();
+    await options.prepareCapture?.(stream);
+    ensureCurrent();
+    response = await options.startGeneration(config);
+    ensureCurrent();
+    if (response.transport !== config.transport)
+      throw new Error("Сервер выбрал неожиданный режим трансляции");
+
+    if (options.createPublisher) {
+      publisher = options.createPublisher(response.transport, response);
+      if (publisher.kind !== response.transport)
+        throw new Error("Издатель не соответствует выбранному транспорту");
+      if (options.connectControl) {
+        const connected = options.connectControl({ response, publisher });
+        control = connected.control;
+        const schedule =
+          options.schedule ??
+          ((callback: () => void, delay: number) =>
+            globalThis.setTimeout(callback, delay));
+        const cancelScheduled =
+          options.cancelScheduled ??
+          ((timer: unknown) =>
+            globalThis.clearTimeout(timer as ReturnType<typeof setTimeout>));
+        let authenticationTimer: unknown;
+        try {
+          await Promise.race([
+            connected.authenticated,
+            new Promise<never>((_resolve, reject) => {
+              authenticationTimer = schedule(
+                () =>
+                  reject(
+                    new Error(
+                      "Не удалось завершить аутентификацию управляющего соединения.",
+                    ),
+                  ),
+                CONTROL_AUTH_TIMEOUT_MS,
+              );
+            }),
+          ]);
+        } finally {
+          if (authenticationTimer !== undefined)
+            cancelScheduled(authenticationTimer);
+        }
+        ensureCurrent();
+      }
+      await publisher.start({
+        generation: response.generation,
+        stream,
+        settings: options.settings ?? DEFAULT_STREAM_SETTINGS,
+        livekit: response.transport === "server" ? response.livekit : undefined,
+        iceServers:
+          response.transport === "p2p" ? response.iceServers : undefined,
+        send: control?.send ?? (() => {}),
+      });
+      ensureCurrent();
+      control?.send({
+        type: "broadcast-ready",
+        generation: response.generation,
+      });
+    }
+
+    return { config, stream, response, publisher, control };
+  } catch (error) {
+    await cleanup();
+    if (error instanceof StaleStudioStart) return null;
+    throw error;
+  }
+}
+
+export async function stopStudioBroadcast(options: {
+  stopPublisher(): Promise<void>;
+  stopGeneration(): Promise<void>;
+}) {
+  let failure: unknown;
+  try {
+    await options.stopPublisher();
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    await options.stopGeneration();
+  } catch (error) {
+    failure ??= error;
+  }
+  if (failure !== undefined) throw failure;
+}
+
+export async function readPublisherMetrics(
+  source: RTCStatsProvider,
+  previous?: CounterSample,
+): Promise<{ metrics: StreamMetrics; sample?: CounterSample }> {
+  if (source.getMetrics)
+    return { metrics: await source.getMetrics(), sample: previous };
+  const report = await source.getStats();
+  return parseOutboundStats(report.values(), previous);
 }
 
 export type LatestSettingsUpdaterOptions<T, R> = {

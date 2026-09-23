@@ -1,12 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createLatestSettingsUpdater,
   createStatsSessionGuard,
   formatCaptureFrameRate,
+  loadBroadcastConfigSafely,
   loadStreamSettingsSafely,
+  readPublisherMetrics,
+  saveBroadcastConfigSafely,
   saveStreamSettingsSafely,
+  startStudioBroadcast,
+  stopStudioBroadcast,
 } from "./studioRuntime";
 import { DEFAULT_STREAM_SETTINGS } from "./quality";
+import type { StartResponse } from "./protocol";
+import type { StudioPublisher } from "./studioTransport";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -429,5 +436,319 @@ describe("Studio capture labels", () => {
     expect(formatCaptureFrameRate(undefined)).toBe("—");
     expect(formatCaptureFrameRate(0)).toBe("—");
     expect(formatCaptureFrameRate(29.7)).toBe("30 FPS");
+  });
+});
+
+function fakeStream(stop = vi.fn()) {
+  return {
+    getTracks: () => [{ stop }],
+    getVideoTracks: () => [{ applyConstraints: vi.fn() }],
+    getAudioTracks: () => [],
+  } as unknown as MediaStream;
+}
+
+function fakePublisher(
+  kind: StudioPublisher["kind"],
+  overrides: Partial<StudioPublisher> = {},
+): StudioPublisher {
+  return {
+    kind,
+    start: vi.fn().mockResolvedValue(undefined),
+    updateSettings: vi.fn(),
+    getStatsSources: vi.fn().mockReturnValue({}),
+    setMuted: vi.fn(),
+    stop: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  };
+}
+
+describe("Studio broadcast orchestration", () => {
+  it("does not register a generation when capture is cancelled", async () => {
+    const startGeneration = vi.fn();
+
+    await expect(
+      startStudioBroadcast({
+        capture: () => Promise.reject(new DOMException("cancel", "AbortError")),
+        startGeneration,
+      }),
+    ).resolves.toBeNull();
+
+    expect(startGeneration).not.toHaveBeenCalled();
+  });
+
+  it("stops captured tracks when generation preparation fails", async () => {
+    const stop = vi.fn();
+    const stream = fakeStream(stop);
+
+    await expect(
+      startStudioBroadcast({
+        capture: async () => stream,
+        startGeneration: async () => {
+          throw new Error("LiveKit offline");
+        },
+      }),
+    ).rejects.toThrow("LiveKit offline");
+
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an invalid limit before capture and preserves an arbitrary-length limit", async () => {
+    const capture = vi.fn(async () => fakeStream());
+    const startGeneration = vi.fn(async () => ({
+      generation: 7,
+      ticket: "ticket",
+      transport: "p2p" as const,
+      iceServers: [],
+    }));
+
+    await expect(
+      startStudioBroadcast({
+        transport: "p2p",
+        viewerLimit: "0",
+        capture,
+        startGeneration,
+      }),
+    ).rejects.toThrow("Лимит зрителей");
+    expect(capture).not.toHaveBeenCalled();
+
+    const hugeLimit = "9".repeat(120);
+    await startStudioBroadcast({
+      transport: "p2p",
+      viewerLimit: hugeLimit,
+      capture,
+      startGeneration,
+    });
+    expect(startGeneration).toHaveBeenCalledWith({
+      transport: "p2p",
+      viewerLimit: hugeLimit,
+    });
+  });
+
+  it("selects the publisher factory from the confirmed response transport", async () => {
+    const response: StartResponse = {
+      generation: 4,
+      ticket: "ticket",
+      transport: "p2p",
+      iceServers: [{ urls: ["stun:example.test:3478"] }],
+    };
+    const publisher = fakePublisher("p2p");
+    const createPublisher = vi.fn(() => publisher);
+
+    await startStudioBroadcast({
+      transport: "p2p",
+      viewerLimit: "10",
+      capture: async () => fakeStream(),
+      startGeneration: async () => response,
+      createPublisher,
+    });
+
+    expect(createPublisher).toHaveBeenCalledWith("p2p", response);
+    expect(publisher.start).toHaveBeenCalledWith(
+      expect.objectContaining({
+        generation: 4,
+        iceServers: response.iceServers,
+      }),
+    );
+  });
+
+  it("waits for host control authentication before starting and announcing the publisher", async () => {
+    const authenticated = deferred<void>();
+    const events: string[] = [];
+    const publisher = fakePublisher("server", {
+      start: vi.fn(async () => {
+        events.push("publisher:start");
+      }),
+    });
+    const control = {
+      send: vi.fn(() => events.push("broadcast-ready")),
+      close: vi.fn(),
+    };
+    const starting = startStudioBroadcast({
+      capture: async () => fakeStream(),
+      startGeneration: async () => ({
+        generation: 3,
+        ticket: "ticket",
+        transport: "server" as const,
+        livekit: { url: "wss://livekit.test", token: "token" },
+      }),
+      createPublisher: () => publisher,
+      connectControl: () => {
+        events.push("control:connect");
+        return {
+          control,
+          authenticated: authenticated.promise.then(() => {
+            events.push("control:authenticated");
+          }),
+        };
+      },
+    });
+
+    await Promise.resolve();
+    expect(publisher.start).not.toHaveBeenCalled();
+    authenticated.resolve();
+    await starting;
+    expect(events).toEqual([
+      "control:connect",
+      "control:authenticated",
+      "publisher:start",
+      "broadcast-ready",
+    ]);
+  });
+
+  it("times out silent host authentication and cleans the prepared generation", async () => {
+    const authenticated = deferred<void>();
+    const publisher = fakePublisher("server");
+    const control = { send: vi.fn(), close: vi.fn() };
+    const stopTrack = vi.fn();
+    const stopGeneration = vi.fn().mockResolvedValue(undefined);
+    let expire!: () => void;
+    const starting = startStudioBroadcast({
+      capture: async () => fakeStream(stopTrack),
+      startGeneration: async () => ({
+        generation: 6,
+        ticket: "ticket",
+        transport: "server" as const,
+        livekit: { url: "wss://livekit.test", token: "token" },
+      }),
+      createPublisher: () => publisher,
+      connectControl: () => ({ control, authenticated: authenticated.promise }),
+      stopGeneration,
+      schedule: (callback) => {
+        expire = callback;
+        return "authentication-timeout";
+      },
+      cancelScheduled: vi.fn(),
+    });
+
+    await vi.waitFor(() => expect(expire).toBeTypeOf("function"));
+    expire();
+
+    await expect(starting).rejects.toThrow("аутентификацию");
+    expect(control.close).toHaveBeenCalledTimes(1);
+    expect(publisher.stop).toHaveBeenCalledTimes(1);
+    expect(stopTrack).toHaveBeenCalledTimes(1);
+    expect(stopGeneration).toHaveBeenCalledWith(6);
+  });
+
+  it("cleans every owned resource and registered generation after publisher failure", async () => {
+    const stopTrack = vi.fn();
+    const publisher = fakePublisher("server", {
+      start: vi.fn().mockRejectedValue(new Error("publish failed")),
+    });
+    const control = { send: vi.fn(), close: vi.fn() };
+    const stopGeneration = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      startStudioBroadcast({
+        capture: async () => fakeStream(stopTrack),
+        startGeneration: async () => ({
+          generation: 9,
+          ticket: "ticket",
+          transport: "server" as const,
+          livekit: { url: "wss://livekit.test", token: "token" },
+        }),
+        createPublisher: () => publisher,
+        connectControl: () => ({
+          control,
+          authenticated: Promise.resolve(),
+        }),
+        stopGeneration,
+      }),
+    ).rejects.toThrow("publish failed");
+
+    expect(control.close).toHaveBeenCalledTimes(1);
+    expect(publisher.stop).toHaveBeenCalledTimes(1);
+    expect(stopTrack).toHaveBeenCalledTimes(1);
+    expect(stopGeneration).toHaveBeenCalledWith(9);
+  });
+
+  it("discards a stale publisher completion before broadcast-ready", async () => {
+    const started = deferred<void>();
+    let current = true;
+    const publisher = fakePublisher("p2p", {
+      start: vi.fn(() => started.promise),
+    });
+    const control = { send: vi.fn(), close: vi.fn() };
+    const stopGeneration = vi.fn().mockResolvedValue(undefined);
+    const starting = startStudioBroadcast({
+      transport: "p2p",
+      viewerLimit: "10",
+      capture: async () => fakeStream(),
+      startGeneration: async () => ({
+        generation: 12,
+        ticket: "ticket",
+        transport: "p2p" as const,
+        iceServers: [],
+      }),
+      createPublisher: () => publisher,
+      connectControl: () => ({
+        control,
+        authenticated: Promise.resolve(),
+      }),
+      stopGeneration,
+      isCurrent: () => current,
+    });
+
+    await vi.waitFor(() => expect(publisher.start).toHaveBeenCalledTimes(1));
+    current = false;
+    started.resolve();
+
+    await expect(starting).resolves.toBeNull();
+    expect(control.send).not.toHaveBeenCalled();
+    expect(control.close).toHaveBeenCalledTimes(1);
+    expect(publisher.stop).toHaveBeenCalledTimes(1);
+    expect(stopGeneration).toHaveBeenCalledWith(12);
+  });
+
+  it("stops the publisher before unregistering its generation", async () => {
+    const events: string[] = [];
+
+    await stopStudioBroadcast({
+      stopPublisher: async () => {
+        events.push("publisher.stop");
+      },
+      stopGeneration: async () => {
+        events.push("/stop");
+      },
+    });
+
+    expect(events).toEqual(["publisher.stop", "/stop"]);
+  });
+});
+
+describe("Studio broadcast config storage", () => {
+  const blockedStorage = () => {
+    throw new DOMException("Storage access denied", "SecurityError");
+  };
+
+  it("uses broadcast defaults when acquiring localStorage throws", () => {
+    expect(loadBroadcastConfigSafely(blockedStorage)).toEqual({
+      transport: "server",
+      viewerLimit: "10",
+    });
+  });
+
+  it("keeps the Studio usable when localStorage acquisition fails on save", () => {
+    expect(() =>
+      saveBroadcastConfigSafely(blockedStorage, {
+        transport: "p2p",
+        viewerLimit: "123456789012345678901234567890",
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe("Studio publisher metrics", () => {
+  it("uses publisher-provided aggregate metrics instead of reparsing a synthetic report", async () => {
+    const getStats = vi.fn();
+    const metrics = { bitrateKbps: 2400, packets: 42, rttMs: 80 };
+
+    await expect(
+      readPublisherMetrics({
+        getStats,
+        getMetrics: async () => metrics,
+      }),
+    ).resolves.toEqual({ metrics, sample: undefined });
+    expect(getStats).not.toHaveBeenCalled();
   });
 });
