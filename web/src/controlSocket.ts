@@ -22,9 +22,14 @@ export type ControlSocketOptions = {
   clearTimeout?: (timer: unknown) => void;
 };
 
+export type ControlSocketSignal = Exclude<
+  ClientSignal,
+  { type: "authenticate" }
+>;
+
 export type ControlSocket = {
   connect(ticket: string): void;
-  send(signal: ClientSignal): void;
+  send(signal: ControlSocketSignal): void;
   close(): void;
 };
 
@@ -57,7 +62,7 @@ export function createControlSocket(
   let highestGeneration = 0;
   let disposed = false;
   let fatal = false;
-  let queue: ClientSignal[] = [];
+  let queue: ControlSocketSignal[] = [];
 
   const fail = (error: unknown) => {
     if (disposed || fatal) return;
@@ -79,7 +84,7 @@ export function createControlSocket(
     }, delay);
   };
 
-  const handleSignal = (event: SocketEvent) => {
+  const handleSignal = (source: WebSocketLike, event: SocketEvent) => {
     if (disposed || typeof event.data !== "string") return;
     let signal: ServerSignal;
     try {
@@ -98,7 +103,13 @@ export function createControlSocket(
       if (signal.generation < highestGeneration) return;
       highestGeneration = signal.generation;
     }
-    if (signal.type === "authenticated") reconnectAttempts = 0;
+    if (signal.type === "authenticated") {
+      reconnectAttempts = 0;
+      writableSocket = source;
+      const pending = queue;
+      queue = [];
+      for (const queued of pending) source.send(JSON.stringify(queued));
+    }
     options.onSignal(signal);
   };
 
@@ -116,14 +127,10 @@ export function createControlSocket(
     next.addEventListener("open", () => {
       if (disposed || socket !== next || authenticated) return;
       authenticated = true;
-      writableSocket = next;
       next.send(JSON.stringify({ type: "authenticate", ticket }));
-      const pending = queue;
-      queue = [];
-      for (const signal of pending) next.send(JSON.stringify(signal));
     });
     next.addEventListener("message", (event) => {
-      if (socket === next) handleSignal(event);
+      if (socket === next) handleSignal(next, event);
     });
     next.addEventListener("close", () => {
       if (disposed || socket !== next) return;
@@ -145,6 +152,7 @@ export function createControlSocket(
     },
     send(signal) {
       if (disposed || fatal) return;
+      if ((signal as ClientSignal).type === "authenticate") return;
       if (socket === undefined || writableSocket !== socket) {
         queue.push(signal);
         return;

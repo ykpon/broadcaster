@@ -109,7 +109,7 @@ describe("control socket", () => {
     expect(events.map((event) => event.generation)).toEqual([2]);
   });
 
-  it("queues application messages behind authentication", () => {
+  it("queues application messages until server authentication", () => {
     const { control, sockets } = socketHarness();
     const message: ClientSignal = { type: "broadcast-ready", generation: 4 };
     control.connect("ticket-1");
@@ -121,8 +121,55 @@ describe("control socket", () => {
     control.send(next);
     expect(sockets[0].sent).toEqual([
       JSON.stringify({ type: "authenticate", ticket: "ticket-1" }),
+    ]);
+
+    sockets[0].emitMessage({ type: "authenticated", generation: 4 });
+    expect(sockets[0].sent).toEqual([
+      JSON.stringify({ type: "authenticate", ticket: "ticket-1" }),
       JSON.stringify(message),
       JSON.stringify(next),
+    ]);
+
+    const after: ClientSignal = { type: "broadcast-ready", generation: 4 };
+    control.send(after);
+    expect(sockets[0].sent.at(-1)).toBe(JSON.stringify(after));
+  });
+
+  it("keeps queued messages when an unauthenticated socket is rejected", async () => {
+    const harness = socketHarness();
+    const message: ClientSignal = { type: "broadcast-ready", generation: 4 };
+    harness.control.connect("ticket-1");
+    harness.control.send(message);
+    harness.sockets[0].emitOpen();
+    harness.sockets[0].emitClose();
+
+    await harness.fireNextTimer();
+    harness.sockets[1].emitOpen();
+    expect(harness.sockets[1].sent).toEqual([
+      JSON.stringify({ type: "authenticate", ticket: "fresh-ticket" }),
+    ]);
+    harness.sockets[1].emitMessage({
+      type: "authenticated",
+      generation: 4,
+    });
+    expect(harness.sockets[1].sent).toEqual([
+      JSON.stringify({ type: "authenticate", ticket: "fresh-ticket" }),
+      JSON.stringify(message),
+    ]);
+  });
+
+  it("rejects caller-supplied authentication frames", () => {
+    const { control, sockets } = socketHarness();
+    const injected = { type: "authenticate", ticket: "attacker-ticket" };
+    control.send(injected as never);
+    control.connect("ticket-1");
+    sockets[0].emitOpen();
+    control.send(injected as never);
+    sockets[0].emitMessage({ type: "authenticated", generation: 1 });
+    control.send(injected as never);
+
+    expect(sockets[0].sent).toEqual([
+      JSON.stringify({ type: "authenticate", ticket: "ticket-1" }),
     ]);
   });
 
