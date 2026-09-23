@@ -37,10 +37,6 @@ type Room struct {
 	Peers                      map[string]*signalPeer    `json:"-"`
 	HostGrace                  *hostGrace                `json:"-"`
 	Controlled                 bool                      `json:"-"`
-	Legacy                     bool                      `json:"-"`
-	// ViewerPrepared is cleared permanently when any host ticket is issued or
-	// a host is observed, even if that host later disconnects.
-	ViewerPrepared bool `json:"-"`
 }
 type bucket struct {
 	Start time.Time
@@ -104,7 +100,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rooms/{id}/join", s.join)
 	mux.HandleFunc("POST /api/rooms/{id}/signal-ticket", s.signalTicket)
 	mux.HandleFunc("GET /api/rooms/{id}/signal", s.signal)
-	mux.HandleFunc("POST /api/rooms/{id}/viewer-token", s.viewer)
 	mux.HandleFunc("POST /api/rooms/{id}/end", s.end)
 	mux.HandleFunc("GET /api/", func(w http.ResponseWriter, r *http.Request) { problem(w, 404, "Маршрут не найден") })
 	mux.HandleFunc("GET /", s.static)
@@ -201,10 +196,6 @@ func (s *Server) roomInfo(room *Room) RoomInfo {
 	return RoomInfo{RoomID: room.ID, State: room.State, Viewers: room.Viewers, Generation: room.Generation, Transport: room.Transport, ViewerLimit: room.ViewerLimit.String()}
 }
 
-func canAdoptViewerPrepared(room *Room) bool {
-	return room != nil && room.Active && room.Legacy && room.ViewerPrepared && room.Generation == 1 && room.Transport == TransportServer && room.MediaRoom != "" && room.State == "waiting" && room.Peers["host"] == nil && room.HostGrace == nil
-}
-
 type startInput struct {
 	HostSecret  string    `json:"hostSecret"`
 	Transport   Transport `json:"transport"`
@@ -222,7 +213,7 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "Некорректная конфигурация эфира")
 		return
 	}
-	response, code, message := s.startRoom(r.Context(), r.PathValue("id"), input.HostSecret, input.Transport, limit, false)
+	response, code, message := s.startRoom(r.Context(), r.PathValue("id"), input.HostSecret, input.Transport, limit)
 	if code != 200 {
 		problem(w, code, message)
 		return
@@ -230,7 +221,7 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, response)
 }
 
-func (s *Server) startRoom(ctx context.Context, id, secret string, transport Transport, limit ViewerLimit, legacy bool) (StartResponse, int, string) {
+func (s *Server) startRoom(ctx context.Context, id, secret string, transport Transport, limit ViewerLimit) (StartResponse, int, string) {
 	s.mu.Lock()
 	room := s.rooms[id]
 	if room == nil {
@@ -241,58 +232,14 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		s.mu.Unlock()
 		return StartResponse{}, 410, "Эфир завершён"
 	}
-	adoptingLegacy := !legacy && transport == TransportServer && canAdoptViewerPrepared(room)
-	if room.Active && !adoptingLegacy {
+	if room.Active {
 		s.mu.Unlock()
 		return StartResponse{}, 409, "Эфир уже запущен"
 	}
-	// The legacy viewer adapter intentionally permits the initial anonymous
-	// server generation until Viewer migrates to /join.
-	if !legacy {
-		hash := sha256.Sum256([]byte(secret))
-		if subtle.ConstantTimeCompare(hash[:], room.Secret[:]) != 1 {
-			s.mu.Unlock()
-			return StartResponse{}, 403, "Нужна ссылка ведущего с ключом доступа"
-		}
-	}
-	if adoptingLegacy {
-		// A legacy viewer may have prepared generation one before Studio opens.
-		// Adopt only that unused server room; existing viewers keep their token.
-		preparedRoom, generation, mediaRoom, occupied := room, room.Generation, room.MediaRoom, len(room.Seats)
-		if !limit.Allows(occupied) {
-			s.mu.Unlock()
-			return StartResponse{}, 409, "Лимит зрителей меньше занятых мест"
-		}
+	hash := sha256.Sum256([]byte(secret))
+	if subtle.ConstantTimeCompare(hash[:], room.Secret[:]) != 1 {
 		s.mu.Unlock()
-		participants, err := s.media.Participants(ctx, mediaRoom)
-		if err != nil {
-			log.Print(err)
-			return StartResponse{}, 503, "Медиасервер недоступен. Попробуйте ещё раз."
-		}
-		s.mu.Lock()
-		room = s.rooms[id]
-		if room != preparedRoom || !canAdoptViewerPrepared(room) || room.Generation != generation || room.MediaRoom != mediaRoom || len(room.Seats) != occupied || !limit.Allows(len(room.Seats)) {
-			s.mu.Unlock()
-			return StartResponse{}, 409, "Конфигурация комнаты изменилась. Повторите запрос."
-		}
-		for _, participant := range participants {
-			if participant.Identity == "host" {
-				room.ViewerPrepared = false
-				s.mu.Unlock()
-				return StartResponse{}, 409, "Эфир уже запущен"
-			}
-		}
-		room.Legacy = false
-		room.ViewerPrepared = false
-		room.ViewerLimit = limit
-		response := StartResponse{
-			Generation: room.Generation,
-			Transport:  TransportServer,
-			Ticket:     s.issueTicketLocked(room, signalAuth{Role: "host", Generation: room.Generation}),
-			LiveKit:    &LiveKitConnection{URL: s.MediaURL, Token: s.media.Token(room.MediaRoom, "host", true)},
-		}
-		s.mu.Unlock()
-		return response, 200, ""
+		return StartResponse{}, 403, "Нужна ссылка ведущего с ключом доступа"
 	}
 	occupied, generation := len(room.Seats), room.Generation
 	if !limit.Allows(occupied) {
@@ -330,18 +277,14 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 	room.ViewerLimit = limit
 	room.MediaRoom = mediaRoom
 	room.Active = true
-	room.Legacy = legacy
-	room.ViewerPrepared = legacy
 	room.State = "waiting"
 	room.Deleted = false
 	response := StartResponse{Generation: room.Generation, Transport: room.Transport}
-	if !legacy {
-		response.Ticket = s.issueTicketLocked(room, signalAuth{Role: "host", Generation: room.Generation})
-		if transport == TransportP2P {
-			response.IceServers = []IceServer{{URLs: []string{s.STUNURL}}}
-		} else {
-			response.LiveKit = &LiveKitConnection{URL: s.MediaURL, Token: s.media.Token(room.MediaRoom, "host", true)}
-		}
+	response.Ticket = s.issueTicketLocked(room, signalAuth{Role: "host", Generation: room.Generation})
+	if transport == TransportP2P {
+		response.IceServers = []IceServer{{URLs: []string{s.STUNURL}}}
+	} else {
+		response.LiveKit = &LiveKitConnection{URL: s.MediaURL, Token: s.media.Token(room.MediaRoom, "host", true)}
 	}
 	s.notifyStarted(room)
 	s.mu.Unlock()
@@ -352,31 +295,6 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		}
 	}
 	return response, 200, ""
-}
-
-func (s *Server) ensureLegacyServer(ctx context.Context, id string) (int, string) {
-	s.mu.Lock()
-	room := s.rooms[id]
-	if room == nil {
-		s.mu.Unlock()
-		return 404, "Комната не найдена или срок её действия истёк"
-	}
-	if room.State == "ended" {
-		s.mu.Unlock()
-		return 410, "Эфир завершён"
-	}
-	if room.Generation != 0 {
-		if room.Transport != TransportServer || room.MediaRoom == "" {
-			s.mu.Unlock()
-			return 409, "Комната использует другой транспорт"
-		}
-		s.mu.Unlock()
-		return 200, ""
-	}
-	s.mu.Unlock()
-	limit, _ := ParseViewerLimit("10")
-	_, code, message := s.startRoom(ctx, id, "", TransportServer, limit, true)
-	return code, message
 }
 
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
@@ -415,47 +333,6 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"state": "waiting", "generation": input.Generation})
 }
 
-func (s *Server) viewer(w http.ResponseWriter, r *http.Request) {
-	if code, message := s.ensureLegacyServer(r.Context(), r.PathValue("id")); code != 200 {
-		problem(w, code, message)
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	room := s.lookup(w, r, true)
-	if room == nil {
-		return
-	}
-	var input struct {
-		Session string `json:"session"`
-	}
-	if decode(w, r, &input) != nil {
-		problem(w, 400, "Некорректный запрос")
-		return
-	}
-	if err := s.syncRoom(r.Context(), room, time.Now()); err != nil {
-		problem(w, 503, "Не удалось проверить свободные места")
-		return
-	}
-	if room.State == "ended" {
-		problem(w, 410, "Эфир завершён")
-		return
-	}
-	// Session credentials are generated by this server, never chosen by a client.
-	identity := input.Session
-	if _, ok := room.Seats[identity]; !ok {
-		identity = ""
-	}
-	if identity == "" {
-		if !room.ViewerLimit.Allows(len(room.Seats) + 1) {
-			problem(w, 409, "В комнате достигнут лимит зрителей. Попробуйте позже.")
-			return
-		}
-		identity = "viewer-" + randomID()
-	}
-	room.Seats[identity] = time.Now().Add(90 * time.Second)
-	writeJSON(w, 200, map[string]string{"token": s.media.Token(room.MediaRoom, identity, false), "url": s.MediaURL, "session": identity})
-}
 func (s *Server) end(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	room := s.lookup(w, r, false)
@@ -517,29 +394,14 @@ func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error 
 		return err
 	}
 	room.Viewers = 0
-	host, video := false, false
 	for _, p := range participants {
 		if p.Identity == "host" {
-			host = true
-			room.ViewerPrepared = false
-			for _, t := range p.Tracks {
-				if t.Source == "SCREEN_SHARE" {
-					video = true
-				}
-			}
-		} else {
-			room.Viewers++
-			room.Seats[p.Identity] = now.Add(90 * time.Second)
+			continue
 		}
+		room.Viewers++
+		room.Seats[p.Identity] = now.Add(90 * time.Second)
 	}
 	s.expireSeats(room, now)
-	if room.Legacy {
-		if host && video {
-			room.State = "live"
-		} else {
-			room.State = "waiting"
-		}
-	}
 	if len(participants) > 0 {
 		room.EmptySince = time.Time{}
 	} else if room.EmptySince.IsZero() {

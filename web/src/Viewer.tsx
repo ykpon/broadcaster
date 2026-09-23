@@ -1,11 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  Room,
-  RoomEvent,
-  Track,
-  ConnectionState,
-  type RemoteTrack,
-} from "livekit-client";
+import { Track, ConnectionState } from "livekit-client";
 import {
   Check,
   Radio,
@@ -21,7 +15,8 @@ import {
 } from "lucide-react";
 import { Header, ErrorBox, CopyButton, Scene } from "./shared";
 import { useRoomInfo, roomStateLabel } from "./room";
-import { api, message, type Connection } from "./api";
+import { api, message } from "./api";
+import type { JoinResponse } from "./protocol";
 import {
   applyPlayoutBuffer,
   applyPlayoutBufferToTracks,
@@ -36,9 +31,15 @@ import {
 } from "./stats";
 import {
   createIncomingStatsTracker,
+  createViewerSession,
   loadBufferPreferenceSafely,
   saveBufferPreferenceSafely,
 } from "./viewerRuntime";
+import {
+  createViewerTransportController,
+  type ViewerMediaTrack,
+  type ViewerTransportController,
+} from "./viewerTransport";
 export default function Viewer({ id }: { id: string }) {
   const { info, error: infoError } = useRoomInfo(id);
   const [error, setError] = useState(""),
@@ -47,6 +48,7 @@ export default function Viewer({ id }: { id: string }) {
     [hasVideo, setHasVideo] = useState(false),
     [hasAudio, setHasAudio] = useState(false),
     [blocked, setBlocked] = useState(false),
+    [roomEnded, setRoomEnded] = useState(false),
     [volume, setVolume] = useState(0.8),
     [muted, setMuted] = useState(false),
     [fit, setFit] = useState(false),
@@ -59,23 +61,24 @@ export default function Viewer({ id }: { id: string }) {
     ),
     [videoMetrics, setVideoMetrics] = useState<StreamMetrics>({}),
     [audioMetrics, setAudioMetrics] = useState<StreamMetrics>({}),
-    [state, setState] = useState(ConnectionState.Disconnected);
-  const roomRef = useRef<Room | null>(null),
+    [state, setState] = useState<string>(ConnectionState.Disconnected);
+  const controllerRef = useRef<ViewerTransportController | null>(null),
+    sessionRef = useRef<ReturnType<typeof createViewerSession> | null>(null),
     video = useRef<HTMLVideoElement>(null),
     audio = useRef<HTMLAudioElement>(null),
     player = useRef<HTMLDivElement>(null),
     bufferRef = useRef(buffer),
-    remoteTracks = useRef(new Set<RemoteTrack>()),
+    remoteTracks = useRef(new Set<ViewerMediaTrack>()),
     videoStats = useRef(
-      createIncomingStatsTracker<RemoteTrack, CounterSample>(),
+      createIncomingStatsTracker<ViewerMediaTrack, CounterSample>(),
     ),
     audioStats = useRef(
-      createIncomingStatsTracker<RemoteTrack, CounterSample>(),
+      createIncomingStatsTracker<ViewerMediaTrack, CounterSample>(),
     ),
     mounted = useRef(true);
-  const ended = info?.state === "ended";
+  const ended = roomEnded || info?.state === "ended";
 
-  function replaceStatsTrack(kind: Track.Kind, track: RemoteTrack | null) {
+  function replaceStatsTrack(kind: Track.Kind, track: ViewerMediaTrack | null) {
     const tracker =
       kind === Track.Kind.Video ? videoStats.current : audioStats.current;
     if (!tracker.replace(track)) return;
@@ -84,6 +87,7 @@ export default function Viewer({ id }: { id: string }) {
   }
 
   function resetRemoteState(updateUi = true) {
+    for (const track of remoteTracks.current) track.detach();
     remoteTracks.current.clear();
     videoStats.current.replace(null);
     audioStats.current.replace(null);
@@ -108,8 +112,9 @@ export default function Viewer({ id }: { id: string }) {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      sessionRef.current?.close();
+      controllerRef.current?.dispose();
       resetRemoteState(false);
-      void roomRef.current?.disconnect();
     };
   }, []);
   useEffect(() => {
@@ -143,16 +148,18 @@ export default function Viewer({ id }: { id: string }) {
   }, [volume, muted]);
   useEffect(() => {
     if (ended) {
-      void roomRef.current?.disconnect();
+      sessionRef.current?.close();
+      controllerRef.current?.dispose();
       resetRemoteState();
       setJoined(false);
+      setBusy(false);
     }
   }, [ended]);
   useEffect(() => {
     if (!joined) return;
     const poll = (
       tracker: ReturnType<
-        typeof createIncomingStatsTracker<RemoteTrack, CounterSample>
+        typeof createIncomingStatsTracker<ViewerMediaTrack, CounterSample>
       >,
       setMetrics: (metrics: StreamMetrics) => void,
     ) => {
@@ -195,86 +202,134 @@ export default function Viewer({ id }: { id: string }) {
   async function join() {
     setBusy(true);
     setError("");
-    await roomRef.current?.disconnect();
+    sessionRef.current?.close();
+    controllerRef.current?.dispose();
     resetRemoteState();
     setBlocked(false);
-    const room = new Room({ adaptiveStream: false });
-    roomRef.current = room;
-    room.on(RoomEvent.ConnectionStateChanged, setState);
-    room.on(RoomEvent.TrackSubscribed, (track: RemoteTrack) => {
-      if (!mounted.current || roomRef.current !== room) return;
-      remoteTracks.current.add(track);
-      const trackSupport = applyPlayoutBuffer(track, bufferRef.current);
-      if (remoteTracks.current.size === 1) setPlayoutSupport(trackSupport);
-      else refreshPlayoutSupport();
-      if (track.kind === Track.Kind.Video && video.current) {
-        replaceStatsTrack(Track.Kind.Video, track);
-        track.attach(video.current);
-        setHasVideo(true);
-        void video.current.play().catch(() => setBlocked(true));
-      }
-      if (track.kind === Track.Kind.Audio && audio.current) {
-        replaceStatsTrack(Track.Kind.Audio, track);
-        track.attach(audio.current);
-        setHasAudio(true);
-        void audio.current.play().catch(() => setBlocked(true));
-      }
+    let session: ReturnType<typeof createViewerSession>;
+    const controller = createViewerTransportController({
+      send: (signal) => session.send(signal),
+      onState: (next) => {
+        if (!mounted.current) return;
+        setState(next);
+        if (next === "connecting") setError("");
+        if (next === "connecting" || next === "disconnected") setBlocked(false);
+      },
+      onPlaybackBlocked: () => {
+        if (mounted.current) setBlocked(true);
+      },
+      onError: (failure) => {
+        if (mounted.current) setError(failure);
+      },
+      onTrack: (track) => {
+        if (!mounted.current) return;
+        remoteTracks.current.add(track);
+        const trackSupport = applyPlayoutBuffer(track, bufferRef.current);
+        if (remoteTracks.current.size === 1) setPlayoutSupport(trackSupport);
+        else refreshPlayoutSupport();
+        if (track.kind === Track.Kind.Video && video.current) {
+          replaceStatsTrack(Track.Kind.Video, track);
+          track.attach(video.current);
+          setHasVideo(true);
+          void video.current.play().catch(() => setBlocked(true));
+        }
+        if (track.kind === Track.Kind.Audio && audio.current) {
+          replaceStatsTrack(Track.Kind.Audio, track);
+          track.attach(audio.current);
+          setHasAudio(true);
+          void audio.current.play().catch(() => setBlocked(true));
+        }
+      },
+      onTrackRemoved: (track) => {
+        if (!mounted.current || !remoteTracks.current.has(track)) return;
+        remoteTracks.current.delete(track);
+        track.detach();
+        if (
+          track.kind === Track.Kind.Video &&
+          videoStats.current.current() === track
+        ) {
+          replaceStatsTrack(Track.Kind.Video, null);
+          setHasVideo(false);
+        } else if (
+          track.kind === Track.Kind.Audio &&
+          audioStats.current.current() === track
+        ) {
+          replaceStatsTrack(Track.Kind.Audio, null);
+          setHasAudio(false);
+        }
+        refreshPlayoutSupport();
+      },
     });
-    room.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
-      if (!mounted.current || roomRef.current !== room) return;
-      remoteTracks.current.delete(track);
-      track.detach();
-      if (
-        track.kind === Track.Kind.Video &&
-        videoStats.current.current() === track
-      ) {
-        replaceStatsTrack(Track.Kind.Video, null);
-        setHasVideo(false);
-      } else if (
-        track.kind === Track.Kind.Audio &&
-        audioStats.current.current() === track
-      ) {
-        replaceStatsTrack(Track.Kind.Audio, null);
-        setHasAudio(false);
-      }
-      refreshPlayoutSupport();
-    });
-    room.on(RoomEvent.Disconnected, () => {
-      if (mounted.current && roomRef.current === room) {
-        setJoined(false);
-        resetRemoteState();
-      }
-    });
-    try {
-      let session = "";
-      try {
-        session = sessionStorage.getItem(`viewer:${id}`) || "";
-      } catch {}
-      const auth = await api<Connection>(`/rooms/${id}/viewer-token`, {
-        session,
-      });
-      if (auth.session)
+    controllerRef.current = controller;
+    session = createViewerSession({
+      roomId: id,
+      readSession: () => {
         try {
-          sessionStorage.setItem(`viewer:${id}`, auth.session);
-        } catch {}
-      if (!mounted.current) return;
-      await room.connect(auth.url, auth.token);
-      if (!mounted.current) {
-        await room.disconnect();
-        return;
-      }
-      setJoined(true);
-      await room.startAudio().catch(() => setBlocked(true));
+          return sessionStorage.getItem(`viewer:${id}`) || "";
+        } catch {
+          return "";
+        }
+      },
+      writeSession: (value) => {
+        try {
+          sessionStorage.setItem(`viewer:${id}`, value);
+        } catch {
+          /* Session persistence is best effort. */
+        }
+      },
+      postJoin: (saved) =>
+        api<JoinResponse>(`/rooms/${id}/join`, { session: saved }),
+      postTicket: async (saved) => {
+        const response = await api<{ ticket: string }>(
+          `/rooms/${id}/signal-ticket`,
+          { session: saved },
+        );
+        return response.ticket;
+      },
+      onAuthenticated: () => {
+        if (!mounted.current || sessionRef.current !== session) return;
+        setJoined(true);
+        setBusy(false);
+      },
+      onSignal: (signal) => {
+        if (!mounted.current || sessionRef.current !== session) return;
+        if (signal.type === "room-ended") {
+          setRoomEnded(true);
+          session.close();
+          controller.dispose();
+          setJoined(false);
+          return;
+        }
+        if (signal.type === "error") {
+          setError(signal.error);
+          return;
+        }
+        void controller.handleSignal(signal);
+      },
+      onFatal: (failure) => {
+        if (!mounted.current || sessionRef.current !== session) return;
+        session.close();
+        controller.dispose();
+        setJoined(false);
+        setBusy(false);
+        setError(message(failure));
+      },
+    });
+    sessionRef.current = session;
+    try {
+      await session.join();
     } catch (e) {
-      setError(message(e));
-      await room.disconnect();
-    } finally {
-      setBusy(false);
+      if (mounted.current && sessionRef.current === session) {
+        setError(message(e));
+        setBusy(false);
+      }
+      session.close();
+      controller.dispose();
     }
   }
   async function enablePlayback() {
     try {
-      await roomRef.current?.startAudio();
+      await controllerRef.current?.startAudio();
       await video.current?.play();
       if (hasAudio) await audio.current?.play();
       setBlocked(false);

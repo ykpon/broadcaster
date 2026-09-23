@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -82,7 +81,7 @@ func TestRoomPermissionsAndEnd(t *testing.T) {
 	if c, _ := call(t, h, "POST", path+"/end", `{"hostSecret":"`+secret+`"}`); c != 200 || len(m.deleted) != 1 {
 		t.Fatal(c)
 	}
-	if c, _ := call(t, h, "POST", path+"/viewer-token", `{}`); c != 410 {
+	if c, _ := call(t, h, "POST", path+"/join", `{}`); c != 410 {
 		t.Fatal(c)
 	}
 	if c, _ := call(t, h, "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); c != 410 {
@@ -101,7 +100,21 @@ func TestCreateRoomDoesNotRequireLiveKitAndDefaultsToTen(t *testing.T) {
 	}
 }
 
-func TestHostTokenRouteIsGoneWhileLegacyViewerTokenWorks(t *testing.T) {
+func TestViewerTokenRouteGoneAndJoinDoesNotCreateMedia(t *testing.T) {
+	s, media, id, _ := createTest(t)
+	path := "/api/rooms/" + id
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest("POST", path+"/viewer-token", strings.NewReader(`{}`)))
+	if w.Code != 405 {
+		t.Fatalf("viewer-token returned %d, want 405", w.Code)
+	}
+	code, joined := call(t, s.Handler(), "POST", path+"/join", `{}`)
+	if code != 200 || joined["session"] == "" || joined["ticket"] == "" || len(media.created) != 0 {
+		t.Fatal(code, joined, media.created)
+	}
+}
+
+func TestHostTokenRouteIsGone(t *testing.T) {
 	s, media, id, secret := createTest(t)
 	path := "/api/rooms/" + id
 	w := httptest.NewRecorder()
@@ -111,9 +124,6 @@ func TestHostTokenRouteIsGoneWhileLegacyViewerTokenWorks(t *testing.T) {
 	}
 	if len(media.created) != 0 {
 		t.Fatalf("host-token created media room: %v", media.created)
-	}
-	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
-		t.Fatalf("legacy viewer-token returned %d, want 200", code)
 	}
 }
 
@@ -236,269 +246,12 @@ func TestStartRejectsLimitBelowReservedSessions(t *testing.T) {
 	s, _, id, secret := createTest(t)
 	path := "/api/rooms/" + id
 	for range 2 {
-		if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
+		if code, _ := call(t, s.Handler(), "POST", path+"/join", `{}`); code != 200 {
 			t.Fatal(code)
 		}
 	}
 	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"1"}`); code != 409 {
 		t.Fatal(code)
-	}
-}
-
-func TestLegacyViewerTokenLazilyPreparesServerGenerationOne(t *testing.T) {
-	s, media, id, _ := createTest(t)
-	path := "/api/rooms/" + id
-	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
-		t.Fatal(code)
-	}
-	room := s.rooms[id]
-	if len(room.Tickets) != 0 {
-		t.Fatalf("viewer-only preparation issued a host control ticket: %d", len(room.Tickets))
-	}
-	if !room.ViewerPrepared {
-		t.Fatal("viewer-only generation has no adoption marker")
-	}
-	if room.Generation != 1 || room.Transport != TransportServer || room.ViewerLimit.String() != "10" || len(media.created) != 1 {
-		t.Fatal(room, media.created)
-	}
-	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 || len(media.created) != 1 {
-		t.Fatal(code, media.created)
-	}
-}
-
-func TestDepartedLegacyHostCannotBeAdopted(t *testing.T) {
-	s, media, id, secret := createTest(t)
-	path := "/api/rooms/" + id
-	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
-		t.Fatal(code)
-	}
-	room := s.rooms[id]
-	mediaRoom := room.MediaRoom
-	// /host-token is gone; a host control ticket followed by a departed peer
-	// models the historical legacy-host state that must never be adopted.
-	if code, _ := call(t, s.Handler(), "POST", path+"/signal-ticket", `{"hostSecret":"`+secret+`","generation":1}`); code != 200 {
-		t.Fatal(code)
-	}
-	room.Peers["host"] = &signalPeer{auth: signalAuth{Role: "host", Generation: 1}}
-	delete(room.Peers, "host")
-	room.State = "waiting"
-	media.participants = nil
-	if room.ViewerPrepared {
-		t.Fatal("host ticket did not permanently clear viewer-only marker")
-	}
-	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 409 {
-		t.Fatalf("adopted a formerly hosted legacy room: %d", code)
-	}
-	if room.MediaRoom != mediaRoom || len(media.created) != 1 || len(media.deleted) != 0 {
-		t.Fatal(room, media.created, media.deleted)
-	}
-}
-
-func TestDepartedLegacyMediaHostCannotBeAdopted(t *testing.T) {
-	s, media, id, secret := createTest(t)
-	path := "/api/rooms/" + id
-	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
-		t.Fatal(code)
-	}
-	room := s.rooms[id]
-	// /host-token no longer exists. Simulate its historical media state:
-	// the host appeared in LiveKit, then departed before Studio opened.
-	media.participants = []Participant{{Identity: "host"}}
-	if err := s.syncRoom(context.Background(), room, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	media.participants = nil
-	if err := s.syncRoom(context.Background(), room, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if room.ViewerPrepared {
-		t.Fatal("departed media host did not clear viewer-only marker")
-	}
-	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 409 {
-		t.Fatalf("adopted after a past media host departed: %d", code)
-	}
-}
-
-func TestLegacyAdoptionMediaQueryDoesNotBlockAnotherRoom(t *testing.T) {
-	s, media, id, secret := createTest(t)
-	code, other := call(t, s.Handler(), "POST", "/api/rooms", "")
-	if code != 201 {
-		t.Fatal(code, other)
-	}
-	if code, _ := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/viewer-token", `{}`); code != 200 {
-		t.Fatal(code)
-	}
-	entered, release := make(chan struct{}), make(chan struct{})
-	var releaseOnce sync.Once
-	unblock := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(unblock)
-	media.participantsFn = func(context.Context, string) ([]Participant, error) {
-		close(entered)
-		<-release
-		return nil, nil
-	}
-	h := s.Handler()
-	adoption := make(chan int, 1)
-	go func() {
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, httptest.NewRequest("POST", "/api/rooms/"+id+"/start", strings.NewReader(`{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`)))
-		adoption <- w.Code
-	}()
-	<-entered
-	otherStatus := make(chan int, 1)
-	go func() {
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, httptest.NewRequest("GET", "/api/rooms/"+other["roomId"].(string), nil))
-		otherStatus <- w.Code
-	}()
-	select {
-	case code := <-otherStatus:
-		if code != 200 {
-			t.Fatalf("other room status = %d, want 200", code)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("blocked media query held the global room mutex")
-	}
-	unblock()
-	if code := <-adoption; code != 200 {
-		t.Fatalf("adoption after media query = %d, want 200", code)
-	}
-}
-
-func TestLegacyAdoptionRejectsStaleMediaQueryAfterStopAndRestart(t *testing.T) {
-	s, media, id, secret := createTest(t)
-	path := "/api/rooms/" + id
-	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
-		t.Fatal(code)
-	}
-	entered, release := make(chan struct{}), make(chan struct{})
-	var releaseOnce sync.Once
-	unblock := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(unblock)
-	media.participantsFn = func(context.Context, string) ([]Participant, error) {
-		close(entered)
-		<-release
-		return nil, nil
-	}
-	h := s.Handler()
-	adoption := make(chan int, 1)
-	go func() {
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, httptest.NewRequest("POST", path+"/start", strings.NewReader(`{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`)))
-		adoption <- w.Code
-	}()
-	<-entered
-	stopped := make(chan int, 1)
-	go func() {
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, httptest.NewRequest("POST", path+"/stop", strings.NewReader(`{"hostSecret":"`+secret+`","generation":1}`)))
-		stopped <- w.Code
-	}()
-	select {
-	case code := <-stopped:
-		if code != 200 {
-			t.Fatalf("concurrent stop = %d, want 200", code)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("stop blocked on adoption's media query")
-	}
-	if code, _ := call(t, h, "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 200 {
-		t.Fatalf("new generation start = %d, want 200", code)
-	}
-	unblock()
-	if code := <-adoption; code != 409 {
-		t.Fatalf("stale adoption = %d, want 409", code)
-	}
-	room := s.rooms[id]
-	if room.Generation != 2 || room.Legacy || room.MediaRoom != "broadcast-"+id+"-2" || len(media.created) != 2 || len(media.deleted) != 1 {
-		t.Fatal(room, media.created, media.deleted)
-	}
-}
-
-func TestLegacyAdoptionMediaQueryFailureDoesNotMutateRoom(t *testing.T) {
-	s, media, id, secret := createTest(t)
-	path := "/api/rooms/" + id
-	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
-		t.Fatal(code)
-	}
-	room := s.rooms[id]
-	mediaRoom := room.MediaRoom
-	media.participantsErr = errors.New("media unavailable")
-	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 503 {
-		t.Fatalf("adoption with unavailable media = %d, want 503", code)
-	}
-	if !room.ViewerPrepared || !room.Legacy || !room.Active || room.Generation != 1 || room.MediaRoom != mediaRoom || len(room.Tickets) != 0 || len(media.created) != 1 || len(media.deleted) != 0 {
-		t.Fatal(room, media.created, media.deleted)
-	}
-}
-
-func TestServerStartAdoptsViewerOnlyLegacyGeneration(t *testing.T) {
-	s, media, id, secret := createTest(t)
-	path := "/api/rooms/" + id
-	code, viewer := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`)
-	if code != 200 {
-		t.Fatal(code, viewer)
-	}
-	room := s.rooms[id]
-	mediaRoom := room.MediaRoom
-	if !room.Legacy || room.Generation != 1 || len(media.created) != 1 {
-		t.Fatal(room, media.created)
-	}
-	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"10"}`); code != 409 {
-		t.Fatalf("p2p start over legacy viewers = %d, want 409", code)
-	}
-	if room.MediaRoom != mediaRoom || len(media.created) != 1 || len(media.deleted) != 0 {
-		t.Fatal(room, media.created, media.deleted)
-	}
-	media.participants = []Participant{{Identity: viewer["session"].(string)}}
-	code, started := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`)
-	if code != 200 || started["generation"] != float64(1) || started["transport"] != "server" || started["ticket"] == "" {
-		t.Fatal(code, started)
-	}
-	connection, ok := started["livekit"].(map[string]any)
-	if !ok || connection["url"] != s.MediaURL || connection["token"] == "" {
-		t.Fatal(started)
-	}
-	if room.MediaRoom != mediaRoom || room.Legacy || room.State != "waiting" || len(media.created) != 1 || len(media.deleted) != 0 {
-		t.Fatal(room, media.created, media.deleted)
-	}
-	media.participants = append(media.participants, Participant{Identity: "host"})
-	if err := s.syncRoom(context.Background(), room, time.Now()); err != nil || room.State != "waiting" {
-		t.Fatalf("adopted room became live before host readiness: %q, %v", room.State, err)
-	}
-	host := &signalPeer{auth: signalAuth{Role: "host", Generation: 1}, messages: []time.Time{time.Now()}}
-	room.Peers["host"] = host
-	if !s.routeSignal(id, host, clientSignal{Type: "broadcast-ready", Generation: 1}) || room.State != "live" {
-		t.Fatalf("host readiness did not make room live: %q", room.State)
-	}
-	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 409 {
-		t.Fatalf("second active server start = %d, want 409", code)
-	}
-	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"bad","transport":"server","viewerLimit":"10"}`); code != 409 {
-		t.Fatalf("second active start with invalid secret = %d, want 409", code)
-	}
-	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"10"}`); code != 409 {
-		t.Fatalf("active p2p start = %d, want 409", code)
-	}
-	if room.MediaRoom != mediaRoom || room.Generation != 1 || len(media.created) != 1 || len(media.deleted) != 0 {
-		t.Fatal(room, media.created, media.deleted)
-	}
-}
-
-func TestServerStartDoesNotAdoptLegacyRoomWithHostParticipant(t *testing.T) {
-	s, media, id, secret := createTest(t)
-	path := "/api/rooms/" + id
-	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
-		t.Fatal(code)
-	}
-	room := s.rooms[id]
-	mediaRoom := room.MediaRoom
-	media.participants = []Participant{{Identity: "host"}}
-	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 409 {
-		t.Fatalf("start with existing host = %d, want 409", code)
-	}
-	if !room.Legacy || room.MediaRoom != mediaRoom || len(media.created) != 1 || len(media.deleted) != 0 {
-		t.Fatal(room, media.created, media.deleted)
 	}
 }
 
@@ -513,7 +266,7 @@ func TestEndDeletesOnlyExistingMediaRoom(t *testing.T) {
 func TestTenViewerReservationsAndReconnect(t *testing.T) {
 	s, _, id, _ := createTest(t)
 	h := s.Handler()
-	path := "/api/rooms/" + id + "/viewer-token"
+	path := "/api/rooms/" + id + "/join"
 	session := ""
 	for i := 0; i < 10; i++ {
 		c, b := call(t, h, "POST", path, `{}`)

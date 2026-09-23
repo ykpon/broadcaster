@@ -1,9 +1,86 @@
 import { describe, expect, it } from "vitest";
 import {
+  createViewerSession,
   createIncomingStatsTracker,
   loadBufferPreferenceSafely,
   saveBufferPreferenceSafely,
 } from "./viewerRuntime";
+
+describe("logical viewer session", () => {
+  it("joins once and reports joined only after control authentication", async () => {
+    const events: string[] = [];
+    let onSignal: ((signal: { type: string }) => void) | undefined;
+    const close = () => events.push("closed");
+    const session = createViewerSession({
+      roomId: "room-a",
+      readSession: () => "saved-session",
+      writeSession: (value) => events.push(`saved:${value}`),
+      postJoin: async (value) => {
+        events.push(`join:${value}`);
+        return { session: "viewer-a", ticket: "first-ticket" };
+      },
+      postTicket: async (value) => {
+        events.push(`ticket:${value}`);
+        return "next-ticket";
+      },
+      makeSocket: (options) => {
+        onSignal = options.onSignal as typeof onSignal;
+        return {
+          connect: (ticket: string) => events.push(`connect:${ticket}`),
+          send: () => {},
+          close,
+        };
+      },
+      onAuthenticated: () => events.push("joined"),
+      onSignal: (signal) => events.push(signal.type),
+      onFatal: () => events.push("fatal"),
+    });
+    await session.join();
+    expect(events).toEqual([
+      "join:saved-session",
+      "saved:viewer-a",
+      "connect:first-ticket",
+    ]);
+    onSignal?.({ type: "authenticated" });
+    onSignal?.({ type: "broadcast-started" });
+    expect(events).toEqual([
+      "join:saved-session",
+      "saved:viewer-a",
+      "connect:first-ticket",
+      "joined",
+      "broadcast-started",
+    ]);
+    session.close();
+    expect(events.at(-1)).toBe("closed");
+  });
+
+  it("does not open control after close while /join is pending", async () => {
+    let resolveJoin!: (value: { session: string; ticket: string }) => void;
+    let opened = false;
+    const session = createViewerSession({
+      roomId: "room-a",
+      readSession: () => "",
+      writeSession: () => {},
+      postJoin: () =>
+        new Promise((resolve) => {
+          resolveJoin = resolve;
+        }),
+      postTicket: async () => "ticket",
+      onAuthenticated: () => {},
+      onSignal: () => {},
+      onFatal: () => {},
+      makeSocket: () => {
+        opened = true;
+        return { connect: () => {}, send: () => {}, close: () => {} };
+      },
+    });
+    const pending = session.join();
+    session.close();
+    resolveJoin({ session: "viewer-a", ticket: "ticket" });
+    await pending;
+    expect(opened).toBe(false);
+  });
+});
 
 describe("Viewer storage acquisition", () => {
   const blockedStorage = () => {

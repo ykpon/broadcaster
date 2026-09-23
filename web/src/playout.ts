@@ -1,4 +1,7 @@
-import type { RemoteTrack } from "livekit-client";
+type PlayoutTrack = {
+  receiver?: object | null;
+  setPlayoutDelay?(seconds: number): void;
+};
 
 export type BufferPreference = number | null;
 export type PlayoutSupport =
@@ -44,11 +47,11 @@ export function saveBufferPreference(
 }
 
 export function applyPlayoutBuffer(
-  track: RemoteTrack,
+  track: PlayoutTrack,
   seconds: BufferPreference,
 ): PlayoutSupport {
   seconds = normalizeBufferPreference(seconds);
-  const receiver = track.receiver;
+  const receiver = track.receiver as RTCRtpReceiver | undefined | null;
   if (!receiver) return "unsupported";
 
   if ("jitterBufferTarget" in receiver) {
@@ -62,7 +65,8 @@ export function applyPlayoutBuffer(
 
   if ("playoutDelayHint" in receiver) {
     try {
-      track.setPlayoutDelay(seconds ?? 0);
+      if (track.setPlayoutDelay) track.setPlayoutDelay(seconds ?? 0);
+      else receiver.playoutDelayHint = seconds;
       return "playoutDelayHint";
     } catch {
       return "unsupported";
@@ -72,7 +76,7 @@ export function applyPlayoutBuffer(
 }
 
 export function applyPlayoutBufferToTracks(
-  tracks: Iterable<RemoteTrack>,
+  tracks: Iterable<PlayoutTrack>,
   value: BufferPreference,
 ): PlayoutSupport {
   let support: PlayoutSupport = "unsupported";

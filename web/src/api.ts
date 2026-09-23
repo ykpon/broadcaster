@@ -1,4 +1,4 @@
-export type { Connection, RoomInfo } from "./protocol";
+export type { RoomInfo } from "./protocol";
 export async function api<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`/api${path}`, {
     method: body === undefined ? "GET" : "POST",

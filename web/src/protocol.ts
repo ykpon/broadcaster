@@ -10,9 +10,6 @@ export type RoomInfo = {
 };
 
 export type LiveKitConnection = { url: string; token: string };
-// Temporary compatibility shape for the legacy viewer-token endpoint. The
-// endpoint is removed when Viewer moves to JoinResponse in Task 7.
-export type Connection = LiveKitConnection & { session?: string };
 export type IceServer = { urls: string[] };
 
 type StartResponseBase = {

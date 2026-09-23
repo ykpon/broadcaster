@@ -45,8 +45,6 @@ func (s *Server) issueTicketLocked(room *Room, auth signalAuth) string {
 	}
 	if auth.Role == "viewer" {
 		auth.Generation = 0
-	} else if auth.Role == "host" {
-		room.ViewerPrepared = false
 	}
 	raw := randomID()
 	room.Tickets[ticketHash(raw)] = ticketRecord{Auth: auth, Expires: now.Add(time.Minute)}
@@ -589,7 +587,6 @@ func (s *Server) closeRoomPeers(room *Room) {
 func (s *Server) stopGeneration(room *Room) string {
 	if room.Active {
 		room.Active = false
-		room.ViewerPrepared = false
 		room.State = "waiting"
 		room.EmptySince = s.now()
 		s.cancelHostGrace(room)
