@@ -38,6 +38,9 @@ type Room struct {
 	HostGrace                  *hostGrace                `json:"-"`
 	Controlled                 bool                      `json:"-"`
 	Legacy                     bool                      `json:"-"`
+	// ViewerPrepared is cleared permanently when any host ticket is issued or
+	// a host is observed, even if that host later disconnects.
+	ViewerPrepared bool `json:"-"`
 }
 type bucket struct {
 	Start time.Time
@@ -198,6 +201,10 @@ func (s *Server) roomInfo(room *Room) RoomInfo {
 	return RoomInfo{RoomID: room.ID, State: room.State, Viewers: room.Viewers, Generation: room.Generation, Transport: room.Transport, ViewerLimit: room.ViewerLimit.String()}
 }
 
+func canAdoptViewerPrepared(room *Room) bool {
+	return room != nil && room.Active && room.Legacy && room.ViewerPrepared && room.Generation == 1 && room.Transport == TransportServer && room.MediaRoom != "" && room.State == "waiting" && room.Peers["host"] == nil && room.HostGrace == nil
+}
+
 type startInput struct {
 	HostSecret  string    `json:"hostSecret"`
 	Transport   Transport `json:"transport"`
@@ -234,7 +241,7 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		s.mu.Unlock()
 		return StartResponse{}, 410, "Эфир завершён"
 	}
-	adoptingLegacy := room.Active && !legacy && transport == TransportServer && room.Legacy && room.Generation == 1 && room.Transport == TransportServer && room.MediaRoom != "" && room.State == "waiting" && room.Peers["host"] == nil && room.HostGrace == nil
+	adoptingLegacy := !legacy && transport == TransportServer && canAdoptViewerPrepared(room)
 	if room.Active && !adoptingLegacy {
 		s.mu.Unlock()
 		return StartResponse{}, 409, "Эфир уже запущен"
@@ -251,23 +258,32 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 	if adoptingLegacy {
 		// A legacy viewer may have prepared generation one before Studio opens.
 		// Adopt only that unused server room; existing viewers keep their token.
-		if !limit.Allows(len(room.Seats)) {
+		preparedRoom, generation, mediaRoom, occupied := room, room.Generation, room.MediaRoom, len(room.Seats)
+		if !limit.Allows(occupied) {
 			s.mu.Unlock()
 			return StartResponse{}, 409, "Лимит зрителей меньше занятых мест"
 		}
-		participants, err := s.media.Participants(ctx, room.MediaRoom)
+		s.mu.Unlock()
+		participants, err := s.media.Participants(ctx, mediaRoom)
 		if err != nil {
-			s.mu.Unlock()
 			log.Print(err)
 			return StartResponse{}, 503, "Медиасервер недоступен. Попробуйте ещё раз."
 		}
+		s.mu.Lock()
+		room = s.rooms[id]
+		if room != preparedRoom || !canAdoptViewerPrepared(room) || room.Generation != generation || room.MediaRoom != mediaRoom || len(room.Seats) != occupied || !limit.Allows(len(room.Seats)) {
+			s.mu.Unlock()
+			return StartResponse{}, 409, "Конфигурация комнаты изменилась. Повторите запрос."
+		}
 		for _, participant := range participants {
 			if participant.Identity == "host" {
+				room.ViewerPrepared = false
 				s.mu.Unlock()
 				return StartResponse{}, 409, "Эфир уже запущен"
 			}
 		}
 		room.Legacy = false
+		room.ViewerPrepared = false
 		room.ViewerLimit = limit
 		response := StartResponse{
 			Generation: room.Generation,
@@ -315,13 +331,17 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 	room.MediaRoom = mediaRoom
 	room.Active = true
 	room.Legacy = legacy
+	room.ViewerPrepared = legacy
 	room.State = "waiting"
 	room.Deleted = false
-	response := StartResponse{Generation: room.Generation, Transport: room.Transport, Ticket: s.issueTicketLocked(room, signalAuth{Role: "host", Generation: room.Generation})}
-	if transport == TransportP2P {
-		response.IceServers = []IceServer{{URLs: []string{s.STUNURL}}}
-	} else {
-		response.LiveKit = &LiveKitConnection{URL: s.MediaURL, Token: s.media.Token(room.MediaRoom, "host", true)}
+	response := StartResponse{Generation: room.Generation, Transport: room.Transport}
+	if !legacy {
+		response.Ticket = s.issueTicketLocked(room, signalAuth{Role: "host", Generation: room.Generation})
+		if transport == TransportP2P {
+			response.IceServers = []IceServer{{URLs: []string{s.STUNURL}}}
+		} else {
+			response.LiveKit = &LiveKitConnection{URL: s.MediaURL, Token: s.media.Token(room.MediaRoom, "host", true)}
+		}
 	}
 	s.notifyStarted(room)
 	s.mu.Unlock()
@@ -501,6 +521,7 @@ func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error 
 	for _, p := range participants {
 		if p.Identity == "host" {
 			host = true
+			room.ViewerPrepared = false
 			for _, t := range p.Tracks {
 				if t.Source == "SCREEN_SHARE" {
 					video = true
