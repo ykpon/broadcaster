@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { ConnectionState } from "livekit-client";
-import { api, message, type RoomInfo } from "./api";
+import { api, message } from "./api";
+import type { RoomInfo } from "./protocol";
 export function useRoomInfo(id: string) {
   const [info, setInfo] = useState<RoomInfo>(),
     [error, setError] = useState("");
@@ -27,13 +27,17 @@ export function useRoomInfo(id: string) {
   }, [id]);
   return { info, error };
 }
-export function roomStateLabel(state: ConnectionState) {
-  return state === ConnectionState.Connected
+export type ConnectionStatus =
+  "disconnected" | "connecting" | "connected" | "reconnecting";
+
+export function roomStateLabel(state: ConnectionStatus): string;
+export function roomStateLabel(state: string): string;
+export function roomStateLabel(state: string) {
+  return state === "connected"
     ? "Соединение установлено"
-    : state === ConnectionState.Reconnecting ||
-        state === ConnectionState.SignalReconnecting
+    : state === "reconnecting" || state === "signalReconnecting"
       ? "Переподключение…"
-      : state === ConnectionState.Connecting
+      : state === "connecting"
         ? "Подключение…"
         : "Не подключено";
 }
