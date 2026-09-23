@@ -138,9 +138,7 @@ export async function startStudioBroadcast(
   let control: StudioControl | undefined;
   let active = true;
   let publisherStarted = false;
-  let signalChain = Promise.resolve();
   const pendingPeerReady = new Map<string, ServerSignal>();
-  const startupReadyViewers = new Set<string>();
   const sessionIsCurrent = () =>
     active && (!options.isCurrent || options.isCurrent());
   const ensureCurrent = () => {
@@ -167,24 +165,21 @@ export async function startStudioBroadcast(
     )
       return Promise.resolve();
     if (!publisherStarted) {
-      if (
-        signal.type === "peer-ready" &&
-        publisher.kind === "p2p" &&
-        !startupReadyViewers.has(signal.viewer)
-      ) {
-        startupReadyViewers.add(signal.viewer);
-        pendingPeerReady.set(signal.viewer, signal);
+      if (publisher.kind === "p2p") {
+        if (
+          signal.type === "peer-ready" &&
+          !pendingPeerReady.has(signal.viewer)
+        )
+          pendingPeerReady.set(signal.viewer, signal);
+        if (signal.type === "peer-left") pendingPeerReady.delete(signal.viewer);
       }
       return Promise.resolve();
     }
-    const operation = signalChain.then(() => dispatchSignal(signal));
-    signalChain = operation.catch(() => {});
-    return operation;
+    return dispatchSignal(signal);
   };
   const cleanup = async () => {
     active = false;
     pendingPeerReady.clear();
-    startupReadyViewers.clear();
     control?.close();
     await publisher?.stop().catch(() => {});
     stopTracks(stream);
@@ -252,17 +247,13 @@ export async function startStudioBroadcast(
         send: control?.send ?? (() => {}),
       });
       ensureCurrent();
-      while (pendingPeerReady.size > 0) {
-        const queued = Array.from(pendingPeerReady.values());
-        pendingPeerReady.clear();
-        for (const signal of queued) {
-          ensureCurrent();
-          await dispatchSignal(signal);
-        }
-      }
       publisherStarted = true;
-      startupReadyViewers.clear();
-      await signalChain;
+      const queued = Array.from(pendingPeerReady.values());
+      pendingPeerReady.clear();
+      for (const signal of queued) {
+        ensureCurrent();
+        void dispatchSignal(signal).catch(() => {});
+      }
       ensureCurrent();
       control?.send({
         type: "broadcast-ready",
