@@ -1,4 +1,9 @@
-import { Room, RoomEvent, type LocalAudioTrack, type LocalVideoTrack } from "livekit-client";
+import {
+  Room,
+  RoomEvent,
+  type LocalAudioTrack,
+  type LocalVideoTrack,
+} from "livekit-client";
 import {
   publishScreen,
   unpublishScreen,
@@ -8,8 +13,12 @@ import {
 import type { StreamSettings } from "./quality";
 import type { LiveKitConnection, TransportMode } from "./protocol";
 import type { ControlSocketSignal } from "./controlSocket";
+import type { StreamMetrics } from "./stats";
 
-export type RTCStatsProvider = { getStats(): Promise<RTCStatsReport> };
+export type RTCStatsProvider = {
+  getStats(): Promise<RTCStatsReport>;
+  getMetrics?(): Promise<StreamMetrics>;
+};
 export type PublisherStatsSources = {
   video?: RTCStatsProvider;
   audio?: RTCStatsProvider;
@@ -49,6 +58,11 @@ export type PublisherCallbacks = {
   onPublishedTracksChanged?(
     generation: number,
     sources: PublisherStatsSources,
+  ): void;
+  onPeerCountsChanged?(
+    generation: number,
+    connected: number,
+    failed: number,
   ): void;
 };
 

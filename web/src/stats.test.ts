@@ -1,11 +1,78 @@
 import { describe, expect, it } from "vitest";
 import {
+  aggregateOutboundMetrics,
   formatLimitation,
   formatMetric,
   parseInboundStats,
   parseOutboundStats,
   streamHealth,
 } from "./stats";
+
+describe("aggregated outbound WebRTC stats", () => {
+  it("sums traffic counters and keeps the worst peer health", () => {
+    expect(
+      aggregateOutboundMetrics([
+        {
+          bitrateKbps: 1200,
+          packets: 10,
+          packetsLost: 1,
+          retransmittedPackets: 2,
+          lossPercent: 1,
+          rttMs: 40,
+        },
+        {
+          bitrateKbps: 800,
+          packets: 20,
+          packetsLost: 3,
+          retransmittedPackets: 4,
+          lossPercent: 4,
+          rttMs: 130,
+        },
+      ]),
+    ).toMatchObject({
+      bitrateKbps: 2000,
+      packets: 30,
+      packetsLost: 4,
+      retransmittedPackets: 6,
+      lossPercent: 4,
+      rttMs: 130,
+    });
+  });
+
+  it("uses cpu, bandwidth, other, none limitation precedence", () => {
+    expect(
+      aggregateOutboundMetrics([
+        { limitation: "none" },
+        { limitation: "other" },
+        { limitation: "bandwidth" },
+        { limitation: "cpu" },
+      ]).limitation,
+    ).toBe("cpu");
+    expect(
+      aggregateOutboundMetrics([
+        { limitation: "none" },
+        { limitation: "other" },
+        { limitation: "bandwidth" },
+      ]).limitation,
+    ).toBe("bandwidth");
+    expect(
+      aggregateOutboundMetrics([
+        { limitation: "none" },
+        { limitation: "other" },
+      ]).limitation,
+    ).toBe("other");
+    expect(aggregateOutboundMetrics([{ limitation: "none" }]).limitation).toBe(
+      "none",
+    );
+  });
+
+  it("does not invent zeroes for fields no peer reports", () => {
+    expect(aggregateOutboundMetrics([{}, {}])).toEqual({});
+    expect(
+      aggregateOutboundMetrics([{ codec: "AV1" }, { packets: 2 }]),
+    ).toEqual({ codec: "AV1", packets: 2 });
+  });
+});
 
 describe("outbound WebRTC stats", () => {
   it("считает bitrate, packets, loss, RTT и реальный codec", () => {
