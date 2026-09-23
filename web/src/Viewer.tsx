@@ -12,11 +12,12 @@ import {
   Layers,
   Loader2,
   ArrowUpRight,
+  RefreshCw,
 } from "lucide-react";
 import { Header, ErrorBox, CopyButton, Scene } from "./shared";
 import { useRoomInfo, roomStateLabel } from "./room";
 import { api, message } from "./api";
-import type { JoinResponse } from "./protocol";
+import type { JoinResponse, TransportMode } from "./protocol";
 import {
   applyPlayoutBuffer,
   applyPlayoutBufferToTracks,
@@ -34,6 +35,7 @@ import {
   createViewerSession,
   loadBufferPreferenceSafely,
   saveBufferPreferenceSafely,
+  viewerScene,
 } from "./viewerRuntime";
 import {
   createViewerTransportController,
@@ -49,6 +51,8 @@ export default function Viewer({ id }: { id: string }) {
     [hasAudio, setHasAudio] = useState(false),
     [blocked, setBlocked] = useState(false),
     [roomEnded, setRoomEnded] = useState(false),
+    [broadcastActive, setBroadcastActive] = useState(false),
+    [transport, setTransport] = useState<TransportMode>(),
     [volume, setVolume] = useState(0.8),
     [muted, setMuted] = useState(false),
     [fit, setFit] = useState(false),
@@ -153,6 +157,8 @@ export default function Viewer({ id }: { id: string }) {
       resetRemoteState();
       setJoined(false);
       setBusy(false);
+      setBroadcastActive(false);
+      setTransport(undefined);
     }
   }, [ended]);
   useEffect(() => {
@@ -206,6 +212,8 @@ export default function Viewer({ id }: { id: string }) {
     controllerRef.current?.dispose();
     resetRemoteState();
     setBlocked(false);
+    setBroadcastActive(false);
+    setTransport(undefined);
     let session: ReturnType<typeof createViewerSession>;
     const controller = createViewerTransportController({
       send: (signal) => session.send(signal),
@@ -295,6 +303,8 @@ export default function Viewer({ id }: { id: string }) {
         if (!mounted.current || sessionRef.current !== session) return;
         if (signal.type === "room-ended") {
           setRoomEnded(true);
+          setBroadcastActive(false);
+          setTransport(undefined);
           session.close();
           controller.dispose();
           setJoined(false);
@@ -303,6 +313,13 @@ export default function Viewer({ id }: { id: string }) {
         if (signal.type === "error") {
           setError(signal.error);
           return;
+        }
+        if (signal.type === "broadcast-started") {
+          setBroadcastActive(true);
+          setTransport(signal.transport);
+        } else if (signal.type === "broadcast-stopped") {
+          setBroadcastActive(false);
+          setTransport(undefined);
         }
         void controller.handleSignal(signal);
       },
@@ -343,6 +360,19 @@ export default function Viewer({ id }: { id: string }) {
     videoMetrics.width !== undefined || videoMetrics.height !== undefined
       ? `${formatMetric(videoMetrics.width)} × ${formatMetric(videoMetrics.height)} · ${formatMetric(videoMetrics.fps, " FPS")}`
       : "—";
+  const presentation = viewerScene({
+    joined,
+    active: broadcastActive,
+    transport,
+    p2pFailed: transport === "p2p" && state === "failed",
+    ended,
+  });
+  const transportStatus =
+    transport === "p2p"
+      ? "P2P — напрямую"
+      : transport === "server"
+        ? "Через сервер"
+        : "Транспорт ожидается";
   return (
     <div className="app">
       <Header>
@@ -381,24 +411,12 @@ export default function Viewer({ id }: { id: string }) {
             <audio ref={audio} autoPlay />
             {!hasVideo && (
               <Scene
-                title={
-                  ended
-                    ? "Этот эфир завершён"
-                    : joined
-                      ? "Ведущий готовится к эфиру"
-                      : "Вы приглашены в эфир"
-                }
-                subtitle={
-                  ended
-                    ? "Спасибо, что были рядом. Здесь можно создать собственную комнату."
-                    : joined
-                      ? "Оставайтесь здесь — изображение появится автоматически."
-                      : "Подключитесь, чтобы увидеть трансляцию и услышать звук."
-                }
+                title={presentation.title}
+                subtitle={presentation.subtitle}
                 icon={ended ? <Check size={36} /> : <Radio size={36} />}
               >
                 {" "}
-                {!joined && !ended && (
+                {presentation.action === "join" && (
                   <button
                     className="button primary"
                     onClick={() => void join()}
@@ -412,12 +430,20 @@ export default function Viewer({ id }: { id: string }) {
                     {busy ? "Подключаемся…" : "Смотреть эфир"}
                   </button>
                 )}
-                {ended && (
+                {presentation.action === "retry-p2p" && (
+                  <button
+                    className="button primary"
+                    onClick={() => controllerRef.current?.retryP2P()}
+                  >
+                    <RefreshCw size={18} /> Повторить P2P-подключение
+                  </button>
+                )}
+                {presentation.action === "create-room" && (
                   <a href="/" className="button primary">
                     Создать свою комнату <ArrowUpRight size={16} />
                   </a>
                 )}
-                {joined && (
+                {joined && presentation.action === null && (
                   <span className="waiting-dots">
                     <i />
                     <i />
@@ -596,10 +622,22 @@ export default function Viewer({ id }: { id: string }) {
             </div>
           </div>
         </section>
-        <ErrorBox error={error || infoError} />
+        <ErrorBox
+          error={
+            presentation.action === "retry-p2p" ? infoError : error || infoError
+          }
+        />
         <div className="viewer-note">
-          <ShieldCheck size={15} /> Комната доступна только по ссылке.
-          <span>Устраивайтесь поудобнее.</span>
+          <span className="viewer-note-copy">
+            <ShieldCheck size={15} /> Комната доступна только по ссылке.
+          </span>
+          <span className="viewer-note-details">
+            <span className="viewer-transport-status" aria-live="polite">
+              <span className={`dot ${transport ? "green" : ""}`} />
+              {transportStatus}
+            </span>
+            <span className="viewer-note-relax">Устраивайтесь поудобнее.</span>
+          </span>
         </div>
       </main>
       <footer>

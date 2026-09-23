@@ -8,9 +8,69 @@ import {
   type ControlSocket,
   type ControlSocketOptions,
 } from "./controlSocket";
-import type { JoinResponse, ServerSignal } from "./protocol";
+import type { JoinResponse, ServerSignal, TransportMode } from "./protocol";
 
 type StorageGetter = () => Storage;
+
+export type ViewerSceneAction = "join" | "retry-p2p" | "create-room" | null;
+
+export type ViewerSceneInput = {
+  joined: boolean;
+  active: boolean;
+  transport: TransportMode | undefined;
+  p2pFailed: boolean;
+  ended: boolean;
+};
+
+export function viewerScene({
+  joined,
+  active,
+  transport,
+  p2pFailed,
+  ended,
+}: ViewerSceneInput): {
+  title: string;
+  subtitle: string;
+  action: ViewerSceneAction;
+} {
+  if (ended)
+    return {
+      title: "Этот эфир завершён",
+      subtitle:
+        "Спасибо, что были рядом. Здесь можно создать собственную комнату.",
+      action: "create-room",
+    };
+  if (!joined)
+    return {
+      title: "Вы приглашены в эфир",
+      subtitle: "Подключитесь, чтобы увидеть трансляцию и услышать звук.",
+      action: "join",
+    };
+  if (!active || !transport)
+    return {
+      title: "Ведущий готовится к эфиру",
+      subtitle: "Оставайтесь здесь — изображение появится автоматически.",
+      action: null,
+    };
+  if (transport === "p2p" && p2pFailed)
+    return {
+      title: "Прямое соединение не установлено",
+      subtitle:
+        "Сеть, NAT или firewall не пропускают P2P. Повторите попытку или попросите ведущего запустить эфир через сервер.",
+      action: "retry-p2p",
+    };
+  if (transport === "p2p")
+    return {
+      title: "Устанавливаем прямое соединение",
+      subtitle: "Изображение и звук появятся после подключения к ведущему.",
+      action: null,
+    };
+  return {
+    title: "Подключаемся через сервер",
+    subtitle: "Изображение и звук появятся автоматически.",
+    action: null,
+  };
+}
 
 export type ViewerSessionOptions = {
   roomId: string;

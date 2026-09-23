@@ -4,7 +4,92 @@ import {
   createIncomingStatsTracker,
   loadBufferPreferenceSafely,
   saveBufferPreferenceSafely,
+  viewerScene,
 } from "./viewerRuntime";
+
+describe("viewer scene presentation", () => {
+  it("shows the strict P2P failure and retry action", () => {
+    expect(
+      viewerScene({
+        joined: true,
+        active: true,
+        transport: "p2p",
+        p2pFailed: true,
+        ended: false,
+      }),
+    ).toEqual({
+      title: "Прямое соединение не установлено",
+      subtitle:
+        "Сеть, NAT или firewall не пропускают P2P. Повторите попытку или попросите ведущего запустить эфир через сервер.",
+      action: "retry-p2p",
+    });
+  });
+
+  it("keeps an authenticated viewer in the waiting scene before broadcast", () => {
+    expect(
+      viewerScene({
+        joined: true,
+        active: false,
+        transport: undefined,
+        p2pFailed: false,
+        ended: false,
+      }),
+    ).toEqual({
+      title: "Ведущий готовится к эфиру",
+      subtitle: "Оставайтесь здесь — изображение появится автоматически.",
+      action: null,
+    });
+  });
+
+  it("explains that the server transport is connecting", () => {
+    expect(
+      viewerScene({
+        joined: true,
+        active: true,
+        transport: "server",
+        p2pFailed: false,
+        ended: false,
+      }),
+    ).toEqual({
+      title: "Подключаемся через сервер",
+      subtitle: "Изображение и звук появятся автоматически.",
+      action: null,
+    });
+  });
+
+  it("explains that a direct P2P connection is being established", () => {
+    expect(
+      viewerScene({
+        joined: true,
+        active: true,
+        transport: "p2p",
+        p2pFailed: false,
+        ended: false,
+      }),
+    ).toEqual({
+      title: "Устанавливаем прямое соединение",
+      subtitle: "Изображение и звук появятся после подключения к ведущему.",
+      action: null,
+    });
+  });
+
+  it("keeps the ended scene terminal", () => {
+    expect(
+      viewerScene({
+        joined: true,
+        active: true,
+        transport: "p2p",
+        p2pFailed: true,
+        ended: true,
+      }),
+    ).toEqual({
+      title: "Этот эфир завершён",
+      subtitle:
+        "Спасибо, что были рядом. Здесь можно создать собственную комнату.",
+      action: "create-room",
+    });
+  });
+});
 
 describe("logical viewer session", () => {
   it("joins once and reports joined only after control authentication", async () => {
