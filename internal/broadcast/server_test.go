@@ -251,6 +251,76 @@ func TestLegacyViewerTokenLazilyPreparesServerGenerationOne(t *testing.T) {
 	}
 }
 
+func TestServerStartAdoptsViewerOnlyLegacyGeneration(t *testing.T) {
+	s, media, id, secret := createTest(t)
+	path := "/api/rooms/" + id
+	code, viewer := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`)
+	if code != 200 {
+		t.Fatal(code, viewer)
+	}
+	room := s.rooms[id]
+	mediaRoom := room.MediaRoom
+	if !room.Legacy || room.Generation != 1 || len(media.created) != 1 {
+		t.Fatal(room, media.created)
+	}
+	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"10"}`); code != 409 {
+		t.Fatalf("p2p start over legacy viewers = %d, want 409", code)
+	}
+	if room.MediaRoom != mediaRoom || len(media.created) != 1 || len(media.deleted) != 0 {
+		t.Fatal(room, media.created, media.deleted)
+	}
+	media.participants = []Participant{{Identity: viewer["session"].(string)}}
+	code, started := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`)
+	if code != 200 || started["generation"] != float64(1) || started["transport"] != "server" || started["ticket"] == "" {
+		t.Fatal(code, started)
+	}
+	connection, ok := started["livekit"].(map[string]any)
+	if !ok || connection["url"] != s.MediaURL || connection["token"] == "" {
+		t.Fatal(started)
+	}
+	if room.MediaRoom != mediaRoom || room.Legacy || room.State != "waiting" || len(media.created) != 1 || len(media.deleted) != 0 {
+		t.Fatal(room, media.created, media.deleted)
+	}
+	media.participants = append(media.participants, Participant{Identity: "host"})
+	if err := s.syncRoom(context.Background(), room, time.Now()); err != nil || room.State != "waiting" {
+		t.Fatalf("adopted room became live before host readiness: %q, %v", room.State, err)
+	}
+	host := &signalPeer{auth: signalAuth{Role: "host", Generation: 1}, messages: []time.Time{time.Now()}}
+	room.Peers["host"] = host
+	if !s.routeSignal(id, host, clientSignal{Type: "broadcast-ready", Generation: 1}) || room.State != "live" {
+		t.Fatalf("host readiness did not make room live: %q", room.State)
+	}
+	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 409 {
+		t.Fatalf("second active server start = %d, want 409", code)
+	}
+	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"bad","transport":"server","viewerLimit":"10"}`); code != 409 {
+		t.Fatalf("second active start with invalid secret = %d, want 409", code)
+	}
+	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"10"}`); code != 409 {
+		t.Fatalf("active p2p start = %d, want 409", code)
+	}
+	if room.MediaRoom != mediaRoom || room.Generation != 1 || len(media.created) != 1 || len(media.deleted) != 0 {
+		t.Fatal(room, media.created, media.deleted)
+	}
+}
+
+func TestServerStartDoesNotAdoptLegacyRoomWithHostParticipant(t *testing.T) {
+	s, media, id, secret := createTest(t)
+	path := "/api/rooms/" + id
+	if code, _ := call(t, s.Handler(), "POST", path+"/viewer-token", `{}`); code != 200 {
+		t.Fatal(code)
+	}
+	room := s.rooms[id]
+	mediaRoom := room.MediaRoom
+	media.participants = []Participant{{Identity: "host"}}
+	if code, _ := call(t, s.Handler(), "POST", path+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`); code != 409 {
+		t.Fatalf("start with existing host = %d, want 409", code)
+	}
+	if !room.Legacy || room.MediaRoom != mediaRoom || len(media.created) != 1 || len(media.deleted) != 0 {
+		t.Fatal(room, media.created, media.deleted)
+	}
+}
+
 func TestEndDeletesOnlyExistingMediaRoom(t *testing.T) {
 	s, media, id, secret := createTest(t)
 	path := "/api/rooms/" + id

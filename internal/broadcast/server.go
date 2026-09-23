@@ -234,7 +234,8 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		s.mu.Unlock()
 		return StartResponse{}, 410, "Эфир завершён"
 	}
-	if room.Active {
+	adoptingLegacy := room.Active && !legacy && transport == TransportServer && room.Legacy && room.Generation == 1 && room.Transport == TransportServer && room.MediaRoom != "" && room.State == "waiting" && room.Peers["host"] == nil && room.HostGrace == nil
+	if room.Active && !adoptingLegacy {
 		s.mu.Unlock()
 		return StartResponse{}, 409, "Эфир уже запущен"
 	}
@@ -246,6 +247,36 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 			s.mu.Unlock()
 			return StartResponse{}, 403, "Нужна ссылка ведущего с ключом доступа"
 		}
+	}
+	if adoptingLegacy {
+		// A legacy viewer may have prepared generation one before Studio opens.
+		// Adopt only that unused server room; existing viewers keep their token.
+		if !limit.Allows(len(room.Seats)) {
+			s.mu.Unlock()
+			return StartResponse{}, 409, "Лимит зрителей меньше занятых мест"
+		}
+		participants, err := s.media.Participants(ctx, room.MediaRoom)
+		if err != nil {
+			s.mu.Unlock()
+			log.Print(err)
+			return StartResponse{}, 503, "Медиасервер недоступен. Попробуйте ещё раз."
+		}
+		for _, participant := range participants {
+			if participant.Identity == "host" {
+				s.mu.Unlock()
+				return StartResponse{}, 409, "Эфир уже запущен"
+			}
+		}
+		room.Legacy = false
+		room.ViewerLimit = limit
+		response := StartResponse{
+			Generation: room.Generation,
+			Transport:  TransportServer,
+			Ticket:     s.issueTicketLocked(room, signalAuth{Role: "host", Generation: room.Generation}),
+			LiveKit:    &LiveKitConnection{URL: s.MediaURL, Token: s.media.Token(room.MediaRoom, "host", true)},
+		}
+		s.mu.Unlock()
+		return response, 200, ""
 	}
 	occupied, generation := len(room.Seats), room.Generation
 	if !limit.Allows(occupied) {
