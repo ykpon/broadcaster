@@ -10,6 +10,7 @@ import {
   normalizeViewerLimit,
   saveBroadcastConfig,
   type BroadcastConfig,
+  type ServerSignal,
   type StartResponse,
   type TransportMode,
 } from "./protocol";
@@ -70,6 +71,10 @@ type StudioControl = {
   close(): void;
 };
 
+type StudioSignalingPublisher = StudioPublisher & {
+  handleSignal?(signal: ServerSignal): Promise<void>;
+};
+
 const CONTROL_AUTH_TIMEOUT_MS = 20_000;
 
 export type StartedStudioBroadcast = {
@@ -89,10 +94,11 @@ export type StartStudioBroadcastOptions = {
   createPublisher?(
     transport: TransportMode,
     response: StartResponse,
-  ): StudioPublisher;
+  ): StudioSignalingPublisher;
   connectControl?(input: {
     response: StartResponse;
-    publisher: StudioPublisher;
+    publisher: StudioSignalingPublisher;
+    handleSignal(signal: ServerSignal): Promise<void>;
   }): { control: StudioControl; authenticated: Promise<void> };
   stopGeneration?(generation: number): Promise<void>;
   settings?: StreamSettings;
@@ -128,12 +134,57 @@ export async function startStudioBroadcast(
   }
 
   let response: StartResponse | undefined;
-  let publisher: StudioPublisher | undefined;
+  let publisher: StudioSignalingPublisher | undefined;
   let control: StudioControl | undefined;
+  let active = true;
+  let publisherStarted = false;
+  let signalChain = Promise.resolve();
+  const pendingPeerReady = new Map<string, ServerSignal>();
+  const startupReadyViewers = new Set<string>();
+  const sessionIsCurrent = () =>
+    active && (!options.isCurrent || options.isCurrent());
   const ensureCurrent = () => {
-    if (options.isCurrent && !options.isCurrent()) throw new StaleStudioStart();
+    if (!sessionIsCurrent()) throw new StaleStudioStart();
+  };
+  const dispatchSignal = (signal: ServerSignal) => {
+    if (
+      !response ||
+      !publisher?.handleSignal ||
+      !sessionIsCurrent() ||
+      !("generation" in signal) ||
+      signal.generation !== response.generation
+    )
+      return Promise.resolve();
+    return publisher.handleSignal(signal);
+  };
+  const handleSignal = (signal: ServerSignal) => {
+    if (
+      !response ||
+      !publisher?.handleSignal ||
+      !sessionIsCurrent() ||
+      !("generation" in signal) ||
+      signal.generation !== response.generation
+    )
+      return Promise.resolve();
+    if (!publisherStarted) {
+      if (
+        signal.type === "peer-ready" &&
+        publisher.kind === "p2p" &&
+        !startupReadyViewers.has(signal.viewer)
+      ) {
+        startupReadyViewers.add(signal.viewer);
+        pendingPeerReady.set(signal.viewer, signal);
+      }
+      return Promise.resolve();
+    }
+    const operation = signalChain.then(() => dispatchSignal(signal));
+    signalChain = operation.catch(() => {});
+    return operation;
   };
   const cleanup = async () => {
+    active = false;
+    pendingPeerReady.clear();
+    startupReadyViewers.clear();
     control?.close();
     await publisher?.stop().catch(() => {});
     stopTracks(stream);
@@ -155,7 +206,11 @@ export async function startStudioBroadcast(
       if (publisher.kind !== response.transport)
         throw new Error("Издатель не соответствует выбранному транспорту");
       if (options.connectControl) {
-        const connected = options.connectControl({ response, publisher });
+        const connected = options.connectControl({
+          response,
+          publisher,
+          handleSignal,
+        });
         control = connected.control;
         const schedule =
           options.schedule ??
@@ -196,6 +251,18 @@ export async function startStudioBroadcast(
           response.transport === "p2p" ? response.iceServers : undefined,
         send: control?.send ?? (() => {}),
       });
+      ensureCurrent();
+      while (pendingPeerReady.size > 0) {
+        const queued = Array.from(pendingPeerReady.values());
+        pendingPeerReady.clear();
+        for (const signal of queued) {
+          ensureCurrent();
+          await dispatchSignal(signal);
+        }
+      }
+      publisherStarted = true;
+      startupReadyViewers.clear();
+      await signalChain;
       ensureCurrent();
       control?.send({
         type: "broadcast-ready",

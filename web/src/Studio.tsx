@@ -456,8 +456,7 @@ export default function Studio({ id }: { id: string }) {
           generationRef.current = generation;
           return createdPublisher;
         },
-        connectControl: ({ response, publisher }) => {
-          const activePublisher = publisher as ActivePublisher;
+        connectControl: ({ response, publisher, handleSignal }) => {
           const generation = response.generation;
           let authenticated = false;
           let resolveAuthenticated!: () => void;
@@ -491,12 +490,10 @@ export default function Studio({ id }: { id: string }) {
                 void stopPublishing();
                 return;
               }
-              void activePublisher
-                .handleSignal?.(signal)
-                .catch((failure: unknown) => {
-                  if (publisherRef.current === publisher && mounted.current)
-                    setError(message(failure));
-                });
+              void handleSignal(signal).catch((failure: unknown) => {
+                if (publisherRef.current === publisher && mounted.current)
+                  setError(message(failure));
+              });
             },
             onFatal: (failure) => {
               if (!authenticated) {

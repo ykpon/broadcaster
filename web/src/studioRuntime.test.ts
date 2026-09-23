@@ -12,8 +12,8 @@ import {
   stopStudioBroadcast,
 } from "./studioRuntime";
 import { DEFAULT_STREAM_SETTINGS } from "./quality";
-import type { StartResponse } from "./protocol";
-import type { StudioPublisher } from "./studioTransport";
+import type { ServerSignal, StartResponse } from "./protocol";
+import type { PublisherStart, StudioPublisher } from "./studioTransport";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -593,6 +593,160 @@ describe("Studio broadcast orchestration", () => {
       "publisher:start",
       "broadcast-ready",
     ]);
+  });
+
+  it("replays one current peer-ready received on authentication after the P2P publisher starts", async () => {
+    const events: string[] = [];
+    let startInput: PublisherStart | undefined;
+    const publisher = Object.assign(
+      fakePublisher("p2p", {
+        start: vi.fn(async (input: PublisherStart) => {
+          events.push("publisher:start");
+          startInput = input;
+        }),
+      }),
+      {
+        handleSignal: vi.fn(async (signal: ServerSignal) => {
+          if (!startInput || signal.type !== "peer-ready") return;
+          events.push(`peer-ready:${signal.viewer}`);
+          startInput.send({
+            type: "offer",
+            generation: signal.generation,
+            viewer: signal.viewer,
+            negotiationId: "attempt-1",
+            sdp: "offer-sdp",
+          });
+        }),
+      },
+    );
+    const sent: unknown[] = [];
+    const control = {
+      send: vi.fn((signal: unknown) => {
+        sent.push(signal);
+        if ((signal as { type?: string }).type === "broadcast-ready")
+          events.push("broadcast-ready");
+      }),
+      close: vi.fn(),
+    };
+
+    await startStudioBroadcast({
+      transport: "p2p",
+      viewerLimit: "10",
+      capture: async () => fakeStream(),
+      startGeneration: async () => ({
+        generation: 21,
+        ticket: "ticket",
+        transport: "p2p" as const,
+        iceServers: [],
+      }),
+      createPublisher: () => publisher,
+      connectControl: ({ handleSignal }) => {
+        void handleSignal({
+          type: "peer-ready",
+          generation: 21,
+          viewer: "viewer-a",
+        });
+        void handleSignal({
+          type: "peer-ready",
+          generation: 21,
+          viewer: "viewer-b",
+        });
+        void handleSignal({
+          type: "peer-ready",
+          generation: 21,
+          viewer: "viewer-a",
+        });
+        void handleSignal({
+          type: "peer-ready",
+          generation: 20,
+          viewer: "stale-viewer",
+        });
+        return { control, authenticated: Promise.resolve() };
+      },
+    });
+
+    expect(events).toEqual([
+      "publisher:start",
+      "peer-ready:viewer-a",
+      "peer-ready:viewer-b",
+      "broadcast-ready",
+    ]);
+    expect(sent).toEqual([
+      {
+        type: "offer",
+        generation: 21,
+        viewer: "viewer-a",
+        negotiationId: "attempt-1",
+        sdp: "offer-sdp",
+      },
+      {
+        type: "offer",
+        generation: 21,
+        viewer: "viewer-b",
+        negotiationId: "attempt-1",
+        sdp: "offer-sdp",
+      },
+      { type: "broadcast-ready", generation: 21 },
+    ]);
+    expect(publisher.handleSignal).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops buffered peer-ready when publisher startup becomes stale", async () => {
+    const started = deferred<void>();
+    let current = true;
+    let startInput: PublisherStart | undefined;
+    const publisher = Object.assign(
+      fakePublisher("p2p", {
+        start: vi.fn(async (input: PublisherStart) => {
+          startInput = input;
+          await started.promise;
+        }),
+      }),
+      {
+        handleSignal: vi.fn(async (signal: ServerSignal) => {
+          if (!startInput || signal.type !== "peer-ready") return;
+          startInput.send({
+            type: "offer",
+            generation: signal.generation,
+            viewer: signal.viewer,
+            negotiationId: "late-attempt",
+            sdp: "late-offer",
+          });
+        }),
+      },
+    );
+    const control = { send: vi.fn(), close: vi.fn() };
+    const starting = startStudioBroadcast({
+      transport: "p2p",
+      viewerLimit: "10",
+      capture: async () => fakeStream(),
+      startGeneration: async () => ({
+        generation: 22,
+        ticket: "ticket",
+        transport: "p2p" as const,
+        iceServers: [],
+      }),
+      createPublisher: () => publisher,
+      connectControl: ({ handleSignal }) => {
+        void handleSignal({
+          type: "peer-ready",
+          generation: 22,
+          viewer: "viewer-a",
+        });
+        return { control, authenticated: Promise.resolve() };
+      },
+      stopGeneration: vi.fn().mockResolvedValue(undefined),
+      isCurrent: () => current,
+    });
+
+    await vi.waitFor(() => expect(publisher.start).toHaveBeenCalledTimes(1));
+    current = false;
+    started.resolve();
+
+    await expect(starting).resolves.toBeNull();
+    expect(publisher.handleSignal).not.toHaveBeenCalled();
+    expect(control.send).not.toHaveBeenCalled();
+    expect(publisher.stop).toHaveBeenCalledTimes(1);
   });
 
   it("times out silent host authentication and cleans the prepared generation", async () => {
