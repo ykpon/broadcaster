@@ -47,6 +47,8 @@ server {
         proxy_buffering off;
     }
 
+    # STUN uses UDP 3478 directly on the app host. Nginx does not proxy it;
+    # expose/forward UDP 3478 in the host firewall and NAT instead.
     # React application and Go API.
     location / {
         proxy_pass http://broadcaster_app;
