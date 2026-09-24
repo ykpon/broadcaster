@@ -6,7 +6,9 @@ export default defineConfig({
   use: {
     baseURL: "http://localhost:8080",
     headless: true,
-    channel: process.platform === "win32" ? "msedge" : undefined,
+    channel:
+      process.env.PLAYWRIGHT_CHANNEL ||
+      (process.platform === "win32" ? "msedge" : undefined),
     viewport: { width: 1440, height: 1000 },
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
