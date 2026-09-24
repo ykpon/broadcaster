@@ -3,9 +3,93 @@ import {
   createViewerSession,
   createIncomingStatsTracker,
   loadBufferPreferenceSafely,
+  reduceViewerFailure,
   saveBufferPreferenceSafely,
+  viewerErrorPresentation,
+  visibleViewerError,
   viewerScene,
 } from "./viewerRuntime";
+
+describe("viewer failure lifecycle", () => {
+  const p2pFailure =
+    "Сеть, NAT или firewall не пропускают P2P. Повторите попытку или попросите ведущего запустить эфир через сервер.";
+
+  it.each(["broadcast-stopped", "room-ended"] as const)(
+    "does not render a strict P2P failure after %s",
+    (type) => {
+      const failed = reduceViewerFailure(undefined, {
+        type: "error",
+        scope: "transport",
+        message: p2pFailure,
+      });
+      expect(visibleViewerError(failed, "")).toBe(p2pFailure);
+
+      const inactive = reduceViewerFailure(failed, { type });
+      expect(visibleViewerError(inactive, "")).toBe("");
+    },
+  );
+
+  it("preserves unrelated room errors when a broadcast stops", () => {
+    const failed = reduceViewerFailure(undefined, {
+      type: "error",
+      scope: "room",
+      message: "Комната недоступна",
+    });
+
+    const stopped = reduceViewerFailure(failed, {
+      type: "broadcast-stopped",
+    });
+    expect(visibleViewerError(stopped, "")).toBe("Комната недоступна");
+  });
+
+  it("replaces a transport failure after a fatal control failure", () => {
+    const failed = reduceViewerFailure(undefined, {
+      type: "error",
+      scope: "transport",
+      message: p2pFailure,
+    });
+
+    const fatal = reduceViewerFailure(failed, {
+      type: "control-fatal",
+      message: "Управляющее соединение потеряно",
+    });
+    expect(visibleViewerError(fatal, "")).toBe(
+      "Управляющее соединение потеряно",
+    );
+  });
+
+  it.each([
+    {
+      event: { type: "broadcast-stopped" as const },
+      scene: {
+        joined: true,
+        active: false,
+        transport: undefined,
+        p2pFailed: false,
+        ended: false,
+      },
+    },
+    {
+      event: { type: "room-ended" as const },
+      scene: {
+        joined: false,
+        active: false,
+        transport: undefined,
+        p2pFailed: false,
+        ended: true,
+      },
+    },
+  ])("clears strict P2P presentation after $event.type", ({ event, scene }) => {
+    const failed = reduceViewerFailure(undefined, {
+      type: "error",
+      scope: "transport",
+      message: p2pFailure,
+    });
+    const cleared = reduceViewerFailure(failed, event);
+
+    expect(viewerErrorPresentation(cleared, "", viewerScene(scene))).toBe("");
+  });
+});
 
 describe("viewer scene presentation", () => {
   it("shows the strict P2P failure and retry action", () => {

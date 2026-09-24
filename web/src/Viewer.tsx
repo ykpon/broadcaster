@@ -34,7 +34,11 @@ import {
   createIncomingStatsTracker,
   createViewerSession,
   loadBufferPreferenceSafely,
+  reduceViewerFailure,
   saveBufferPreferenceSafely,
+  type ViewerFailure,
+  type ViewerFailureEvent,
+  viewerErrorPresentation,
   viewerScene,
 } from "./viewerRuntime";
 import {
@@ -44,7 +48,7 @@ import {
 } from "./viewerTransport";
 export default function Viewer({ id }: { id: string }) {
   const { info, error: infoError } = useRoomInfo(id);
-  const [error, setError] = useState(""),
+  const [failure, setFailure] = useState<ViewerFailure>(),
     [joined, setJoined] = useState(false),
     [busy, setBusy] = useState(false),
     [hasVideo, setHasVideo] = useState(false),
@@ -81,6 +85,10 @@ export default function Viewer({ id }: { id: string }) {
     ),
     mounted = useRef(true);
   const ended = roomEnded || info?.state === "ended";
+
+  function updateFailure(event: ViewerFailureEvent) {
+    setFailure((current) => reduceViewerFailure(current, event));
+  }
 
   function replaceStatsTrack(kind: Track.Kind, track: ViewerMediaTrack | null) {
     const tracker =
@@ -159,6 +167,7 @@ export default function Viewer({ id }: { id: string }) {
       setBusy(false);
       setBroadcastActive(false);
       setTransport(undefined);
+      updateFailure({ type: "room-ended" });
     }
   }, [ended]);
   useEffect(() => {
@@ -207,7 +216,7 @@ export default function Viewer({ id }: { id: string }) {
 
   async function join() {
     setBusy(true);
-    setError("");
+    updateFailure({ type: "clear" });
     sessionRef.current?.close();
     controllerRef.current?.dispose();
     resetRemoteState();
@@ -220,14 +229,20 @@ export default function Viewer({ id }: { id: string }) {
       onState: (next) => {
         if (!mounted.current) return;
         setState(next);
-        if (next === "connecting") setError("");
+        if (next === "connecting")
+          updateFailure({ type: "transport-connecting" });
         if (next === "connecting" || next === "disconnected") setBlocked(false);
       },
       onPlaybackBlocked: () => {
         if (mounted.current) setBlocked(true);
       },
       onError: (failure) => {
-        if (mounted.current) setError(failure);
+        if (mounted.current)
+          updateFailure({
+            type: "error",
+            scope: "transport",
+            message: failure,
+          });
       },
       onTrack: (track) => {
         if (!mounted.current) return;
@@ -305,13 +320,18 @@ export default function Viewer({ id }: { id: string }) {
           setRoomEnded(true);
           setBroadcastActive(false);
           setTransport(undefined);
+          updateFailure({ type: "room-ended" });
           session.close();
           controller.dispose();
           setJoined(false);
           return;
         }
         if (signal.type === "error") {
-          setError(signal.error);
+          updateFailure({
+            type: "error",
+            scope: "room",
+            message: signal.error,
+          });
           return;
         }
         if (signal.type === "broadcast-started") {
@@ -320,6 +340,7 @@ export default function Viewer({ id }: { id: string }) {
         } else if (signal.type === "broadcast-stopped") {
           setBroadcastActive(false);
           setTransport(undefined);
+          updateFailure({ type: "broadcast-stopped" });
         }
         void controller.handleSignal(signal);
       },
@@ -329,7 +350,9 @@ export default function Viewer({ id }: { id: string }) {
         controller.dispose();
         setJoined(false);
         setBusy(false);
-        setError(message(failure));
+        setBroadcastActive(false);
+        setTransport(undefined);
+        updateFailure({ type: "control-fatal", message: message(failure) });
       },
     });
     sessionRef.current = session;
@@ -337,7 +360,7 @@ export default function Viewer({ id }: { id: string }) {
       await session.join();
     } catch (e) {
       if (mounted.current && sessionRef.current === session) {
-        setError(message(e));
+        updateFailure({ type: "error", scope: "room", message: message(e) });
         setBusy(false);
       }
       session.close();
@@ -351,9 +374,12 @@ export default function Viewer({ id }: { id: string }) {
       if (hasAudio) await audio.current?.play();
       setBlocked(false);
     } catch {
-      setError(
-        "Браузер заблокировал воспроизведение. Проверьте разрешение звука для сайта.",
-      );
+      updateFailure({
+        type: "error",
+        scope: "room",
+        message:
+          "Браузер заблокировал воспроизведение. Проверьте разрешение звука для сайта.",
+      });
     }
   }
   const receivedVideo =
@@ -514,7 +540,12 @@ export default function Viewer({ id }: { id: string }) {
                     ? document.exitFullscreen()
                     : player.current?.requestFullscreen();
                   void action?.catch(() =>
-                    setError("Полноэкранный режим недоступен в этом браузере."),
+                    updateFailure({
+                      type: "error",
+                      scope: "room",
+                      message:
+                        "Полноэкранный режим недоступен в этом браузере.",
+                    }),
                   );
                 }}
               >
@@ -623,9 +654,7 @@ export default function Viewer({ id }: { id: string }) {
           </div>
         </section>
         <ErrorBox
-          error={
-            presentation.action === "retry-p2p" ? infoError : error || infoError
-          }
+          error={viewerErrorPresentation(failure, infoError, presentation)}
         />
         <div className="viewer-note">
           <span className="viewer-note-copy">

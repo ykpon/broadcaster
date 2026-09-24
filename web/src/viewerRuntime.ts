@@ -12,6 +12,48 @@ import type { JoinResponse, ServerSignal, TransportMode } from "./protocol";
 
 type StorageGetter = () => Storage;
 
+export type ViewerFailure = {
+  message: string;
+  scope: "transport" | "room";
+};
+
+export type ViewerFailureEvent =
+  | { type: "error"; message: string; scope: ViewerFailure["scope"] }
+  | {
+      type:
+        "broadcast-stopped" | "room-ended" | "transport-connecting" | "clear";
+    }
+  | { type: "control-fatal"; message: string };
+
+export function reduceViewerFailure(
+  current: ViewerFailure | undefined,
+  event: ViewerFailureEvent,
+): ViewerFailure | undefined {
+  if (event.type === "error")
+    return { message: event.message, scope: event.scope };
+  if (event.type === "control-fatal")
+    return { message: event.message, scope: "room" };
+  if (event.type === "clear") return undefined;
+  return current?.scope === "transport" ? undefined : current;
+}
+
+export function visibleViewerError(
+  failure: ViewerFailure | undefined,
+  roomError: string,
+): string {
+  return failure?.message || roomError;
+}
+
+export function viewerErrorPresentation(
+  failure: ViewerFailure | undefined,
+  roomError: string,
+  scene: { action: ViewerSceneAction },
+): string {
+  if (scene.action === "retry-p2p" && failure?.scope === "transport")
+    return roomError;
+  return visibleViewerError(failure, roomError);
+}
+
 export type ViewerSceneAction = "join" | "retry-p2p" | "create-room" | null;
 
 export type ViewerSceneInput = {
