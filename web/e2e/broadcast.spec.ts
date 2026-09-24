@@ -33,8 +33,10 @@ async function observeNativePeers(context: BrowserContext, relayOnly = false) {
   await context.addInitScript((forceRelay) => {
     const NativePeer = window.RTCPeerConnection;
     const peers: RTCPeerConnection[] = [];
-    (window as Window & { __testPeers?: RTCPeerConnection[] }).__testPeers =
-      peers;
+    const observedWindow = window as Window & {
+      __testPeers?: RTCPeerConnection[];
+    };
+    observedWindow.__testPeers = peers;
     class ObservedPeer extends NativePeer {
       constructor(config?: RTCConfiguration) {
         super(forceRelay ? { ...config, iceTransportPolicy: "relay" } : config);
@@ -45,15 +47,18 @@ async function observeNativePeers(context: BrowserContext, relayOnly = false) {
   }, relayOnly);
 }
 
-async function expectDirectCandidate(page: Page) {
+async function expectDirectCandidates(page: Page, expectedConnectedPeers = 1) {
   await expect
     .poll(async () =>
-      page.evaluate(async () => {
+      page.evaluate(async (expected) => {
         const peers =
           (window as Window & { __testPeers?: RTCPeerConnection[] })
             .__testPeers ?? [];
-        for (const peer of peers) {
-          if (peer.connectionState !== "connected") continue;
+        const connected = peers.filter(
+          (peer) => peer.connectionState === "connected",
+        );
+        if (connected.length !== expected) return false;
+        for (const peer of connected) {
           const report = await peer.getStats();
           const pairs = [...report.values()].filter(
             (entry) =>
@@ -61,15 +66,40 @@ async function expectDirectCandidate(page: Page) {
               (entry.selected ||
                 (entry.nominated && entry.state === "succeeded")),
           );
+          let direct = false;
           for (const pair of pairs) {
             const remote = report.get(pair.remoteCandidateId);
-            if (remote) return remote.candidateType;
+            if (/^(host|srflx|prflx)$/.test(remote?.candidateType ?? "")) {
+              direct = true;
+              break;
+            }
           }
+          if (!direct) return false;
         }
-        return undefined;
-      }),
+        return true;
+      }, expectedConnectedPeers),
     )
-    .toMatch(/^(host|srflx|prflx)$/);
+    .toBe(true);
+}
+
+function isLiveKitConnection(url: string) {
+  const configuredURL = process.env.LIVEKIT_URL ?? "ws://localhost:7880";
+  return (
+    url.startsWith(configuredURL) ||
+    /\/livekit(?:\/|\?|$)|\/rtc(?:\/|\?|$)|:7880(?:\/|\?|$)/.test(url)
+  );
+}
+
+function observeConnections(page: Page, urls: string[]) {
+  page.on("request", (request) => urls.push(request.url()));
+  page.on("websocket", (socket) => urls.push(socket.url()));
+}
+
+function observeBrowserErrors(page: Page, label: string, errors: string[]) {
+  page.on("pageerror", (error) => errors.push(`${label}: ${error.message}`));
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(`${label}: ${message.text()}`);
+  });
 }
 
 test("реальный SFU: публикация, перезапуск в той же комнате, качество и завершение", async ({
@@ -359,8 +389,10 @@ test("прямой P2P, лимит, смена режима и строгая о
   page,
 }) => {
   test.setTimeout(180_000);
-  const pageErrors: string[] = [];
-  page.on("pageerror", (error) => pageErrors.push(error.message));
+  const browserErrors: string[] = [];
+  const p2pConnections: string[] = [];
+  observeBrowserErrors(page, "host", browserErrors);
+  observeConnections(page, p2pConnections);
   await installCanvasCapture(page);
   await observeNativePeers(page.context());
   await page.goto("/");
@@ -378,7 +410,8 @@ test("прямой P2P, лимит, смена режима и строгая о
       const context = await browser.newContext();
       await observeNativePeers(context);
       const viewer = await context.newPage();
-      viewer.on("pageerror", (error) => pageErrors.push(error.message));
+      observeBrowserErrors(viewer, `viewer ${index + 1}`, browserErrors);
+      observeConnections(viewer, p2pConnections);
       await viewer.goto(viewerURL);
       await viewer.getByRole("button", { name: "Смотреть эфир" }).click();
       viewers.push({ context, page: viewer });
@@ -396,21 +429,61 @@ test("прямой P2P, лимит, смена режима и строгая о
           { timeout: 60000 },
         )
         .toBeGreaterThan(0);
-      await expectDirectCandidate(viewer);
+      await expectDirectCandidates(viewer);
     }
-    await expectDirectCandidate(page);
+    await expectDirectCandidates(page, 2);
+    expect(p2pConnections.filter(isLiveKitConnection)).toEqual([]);
+    expect(browserErrors).toEqual([]);
+    const p2pTracks = await Promise.all(
+      viewers.map(({ page: viewer }) =>
+        viewer
+          .locator("video")
+          .evaluate(
+            (element: HTMLVideoElement) =>
+              (element.srcObject as MediaStream | null)?.getVideoTracks()[0]
+                ?.id,
+          ),
+      ),
+    );
+    const p2pRoom = await (
+      await page.request.get(`/api/rooms/${roomId}`)
+    ).json();
+    expect(p2pRoom).toMatchObject({ transport: "p2p", viewerLimit: "2" });
     const overflow = await page.request.post(`/api/rooms/${roomId}/join`, {
       data: { session: "" },
     });
     expect(overflow.status()).toBe(409);
 
     await page.getByRole("button", { name: "Остановить трансляцию" }).click();
+    for (const peerPage of [
+      page,
+      ...viewers.map(({ page: viewer }) => viewer),
+    ]) {
+      await expect
+        .poll(() =>
+          peerPage.evaluate(() =>
+            (
+              (window as Window & { __testPeers?: RTCPeerConnection[] })
+                .__testPeers ?? []
+            ).every((peer) => peer.connectionState === "closed"),
+          ),
+        )
+        .toBe(true);
+    }
     await page.getByRole("radio", { name: "Через сервер" }).check();
     await page.getByRole("button", { name: "Запустить снова" }).click();
     await expect(page.getByText(/^В прямом эфире ·/)).toBeVisible({
       timeout: 30000,
     });
-    for (const { page: viewer } of viewers) {
+    const serverRoom = await (
+      await page.request.get(`/api/rooms/${roomId}`)
+    ).json();
+    expect(serverRoom).toMatchObject({
+      transport: "server",
+      generation: p2pRoom.generation + 1,
+      viewerLimit: "2",
+    });
+    for (const [index, { page: viewer }] of viewers.entries()) {
       await expect
         .poll(
           () =>
@@ -420,6 +493,23 @@ test("прямой P2P, лимит, смена режима и строгая о
           { timeout: 60000 },
         )
         .toBeGreaterThan(0);
+      await expect
+        .poll(() =>
+          viewer
+            .locator("video")
+            .evaluate(
+              (el: HTMLVideoElement) =>
+                (el.srcObject as MediaStream | null)?.getVideoTracks()[0]?.id,
+            ),
+        )
+        .not.toBe(p2pTracks[index]);
+      await expect
+        .poll(() =>
+          viewer
+            .locator("video")
+            .evaluate((el: HTMLVideoElement) => el.currentTime),
+        )
+        .toBeGreaterThan(0.2);
       await expect(
         viewer.getByRole("button", { name: "Смотреть эфир" }),
       ).toHaveCount(0);
@@ -433,12 +523,10 @@ test("прямой P2P, лимит, смена режима и строгая о
     await observeNativePeers(failedContext, true);
     const failedViewer = await failedContext.newPage();
     viewers.push({ context: failedContext, page: failedViewer });
-    failedViewer.on("pageerror", (error) => pageErrors.push(error.message));
+    observeBrowserErrors(failedViewer, "relay-only viewer", browserErrors);
     const requests: string[] = [];
-    page.on("request", (request) => requests.push(request.url()));
-    page.on("websocket", (socket) => requests.push(socket.url()));
-    failedViewer.on("request", (request) => requests.push(request.url()));
-    failedViewer.on("websocket", (socket) => requests.push(socket.url()));
+    observeConnections(page, requests);
+    observeConnections(failedViewer, requests);
     await failedViewer.goto(viewerURL);
     await failedViewer.clock.install();
     await page.getByRole("button", { name: "Запустить снова" }).click();
@@ -448,10 +536,8 @@ test("прямой P2P, лимит, смена режима и строгая о
     await expect(
       failedViewer.getByText(/Сеть, NAT или firewall/),
     ).toBeVisible();
-    expect(
-      requests.filter((url) => /\/livekit\/|:7880|viewer-token/.test(url)),
-    ).toEqual([]);
-    expect(pageErrors).toEqual([]);
+    expect(requests.filter(isLiveKitConnection)).toEqual([]);
+    expect(browserErrors).toEqual([]);
   } finally {
     for (const { context } of viewers) await context.close();
   }
