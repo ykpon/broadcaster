@@ -35,7 +35,7 @@ type LiveKit struct {
 
 func (l *LiveKit) sign(identity string, grants map[string]any) string {
 	now := time.Now()
-	payload, _ := json.Marshal(map[string]any{"iss": l.Key, "sub": identity, "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(time.Minute).Unix(), "video": grants})
+	payload, _ := json.Marshal(map[string]any{"iss": l.Key, "sub": identity, "jti": randomID(), "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(time.Minute).Unix(), "video": grants})
 	enc := base64.RawURLEncoding
 	data := enc.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + enc.EncodeToString(payload)
 	mac := hmac.New(sha256.New, []byte(l.Secret))

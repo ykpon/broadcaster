@@ -42,6 +42,7 @@ export type BroadcastStartedSignal =
   | {
       type: "broadcast-started";
       generation: number;
+      resync?: boolean;
       transport: "p2p";
       viewerLimit: string;
       iceServers: IceServer[];
@@ -50,6 +51,7 @@ export type BroadcastStartedSignal =
   | {
       type: "broadcast-started";
       generation: number;
+      resync?: boolean;
       transport: "server";
       viewerLimit: string;
       livekit: LiveKitConnection;
@@ -86,6 +88,8 @@ export type ServerSignal =
 
 export type ClientSignal =
   | { type: "authenticate"; ticket: string }
+  | { type: "leave" }
+  | { type: "viewer-retry"; generation: number }
   | { type: "broadcast-ready" | "broadcast-stopped"; generation: number }
   | {
       type: "offer" | "answer";

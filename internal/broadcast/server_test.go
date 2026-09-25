@@ -10,9 +10,40 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+type barrierMedia struct {
+	mu                    sync.Mutex
+	createCalls, deleted  []string
+	firstEntered, release chan struct{}
+}
+
+func (m *barrierMedia) Create(_ context.Context, room string) error {
+	m.mu.Lock()
+	first := len(m.createCalls) == 0
+	m.createCalls = append(m.createCalls, room)
+	m.mu.Unlock()
+	if first {
+		close(m.firstEntered)
+		<-m.release
+	}
+	return nil
+}
+func (m *barrierMedia) Delete(_ context.Context, room string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deleted = append(m.deleted, room)
+	return nil
+}
+func (m *barrierMedia) Participants(context.Context, string) ([]Participant, error) {
+	return nil, nil
+}
+func (m *barrierMedia) Token(room, id string, host bool) string {
+	return (&LiveKit{Key: "test", Secret: "secret"}).Token(room, id, host)
+}
 
 type fakeMedia struct {
 	participants    []Participant
@@ -158,10 +189,54 @@ func TestP2PStartIncludesConfiguredSTUNURL(t *testing.T) {
 func TestServerStartIsTransactional(t *testing.T) {
 	s, media, id, secret := createTest(t)
 	media.createErr = errors.New("offline")
-	code, _ := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/start",
-		`{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`)
+	path := "/api/rooms/" + id + "/start"
+	body := `{"hostSecret":"` + secret + `","transport":"server","viewerLimit":"10"}`
+	code, _ := call(t, s.Handler(), "POST", path,
+		body)
 	if code != 503 || s.rooms[id].Generation != 0 || s.rooms[id].Transport != "" {
 		t.Fatal(code, s.rooms[id])
+	}
+	media.createErr = nil
+	if code, _ := call(t, s.Handler(), "POST", path, body); code != 200 {
+		t.Fatalf("preparation owner was not cleared after failure: %d", code)
+	}
+}
+
+func TestConcurrentServerStartCannotDeleteWinningPreparedRoom(t *testing.T) {
+	media := &barrierMedia{firstEntered: make(chan struct{}), release: make(chan struct{})}
+	s := New(media, "http://localhost", "ws://localhost/livekit", "")
+	code, created := call(t, s.Handler(), "POST", "/api/rooms", "")
+	if code != 201 {
+		t.Fatal(code, created)
+	}
+	id := created["roomId"].(string)
+	secret := strings.Split(created["hostUrl"].(string), "#key=")[1]
+	path := "/api/rooms/" + id + "/start"
+	body := `{"hostSecret":"` + secret + `","transport":"server","viewerLimit":"10"}`
+	type result struct{ code int }
+	first := make(chan result, 1)
+	go func() {
+		code, _ := call(t, s.Handler(), "POST", path, body)
+		first <- result{code: code}
+	}()
+	select {
+	case <-media.firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first start never entered LiveKit preparation")
+	}
+	secondCode, _ := call(t, s.Handler(), "POST", path, body)
+	close(media.release)
+	firstResult := <-first
+
+	media.mu.Lock()
+	createCalls := append([]string(nil), media.createCalls...)
+	deleted := append([]string(nil), media.deleted...)
+	media.mu.Unlock()
+	if firstResult.code != 200 || secondCode != 409 {
+		t.Fatalf("first=%d second=%d", firstResult.code, secondCode)
+	}
+	if len(createCalls) != 1 || len(deleted) != 0 {
+		t.Fatalf("created=%v deleted=%v", createCalls, deleted)
 	}
 }
 

@@ -47,6 +47,41 @@ async function observeNativePeers(context: BrowserContext, relayOnly = false) {
   }, relayOnly);
 }
 
+async function observeControlSockets(context: BrowserContext) {
+  await context.addInitScript(() => {
+    const NativeSocket = window.WebSocket;
+    const sockets: WebSocket[] = [];
+    const observedWindow = window as Window & {
+      __testControlSockets?: WebSocket[];
+    };
+    observedWindow.__testControlSockets = sockets;
+    class ObservedSocket extends NativeSocket {
+      constructor(url: string | URL, protocols?: string | string[]) {
+        super(url, protocols);
+        if (String(url).includes("/signal")) sockets.push(this);
+      }
+    }
+    window.WebSocket = ObservedSocket;
+  });
+}
+
+async function dropLatestControlSocket(page: Page) {
+  await page.evaluate(() => {
+    const sockets =
+      (window as Window & { __testControlSockets?: WebSocket[] })
+        .__testControlSockets ?? [];
+    sockets.at(-1)?.close();
+  });
+}
+
+async function nativePeerCount(page: Page) {
+  return page.evaluate(
+    () =>
+      (window as Window & { __testPeers?: RTCPeerConnection[] }).__testPeers
+        ?.length ?? 0,
+  );
+}
+
 async function expectDirectCandidates(page: Page, expectedConnectedPeers = 1) {
   await expect
     .poll(async () =>
@@ -395,6 +430,7 @@ test("прямой P2P, лимит, смена режима и строгая о
   observeConnections(page, p2pConnections);
   await installCanvasCapture(page);
   await observeNativePeers(page.context());
+  await observeControlSockets(page.context());
   await page.goto("/");
   await page.getByRole("button", { name: "Создать комнату" }).click();
   const viewerURL = await page.getByLabel("Ссылка для зрителей").inputValue();
@@ -409,6 +445,7 @@ test("прямой P2P, лимит, смена режима и строгая о
     for (let index = 0; index < 2; index++) {
       const context = await browser.newContext();
       await observeNativePeers(context);
+      await observeControlSockets(context);
       const viewer = await context.newPage();
       observeBrowserErrors(viewer, `viewer ${index + 1}`, browserErrors);
       observeConnections(viewer, p2pConnections);
@@ -434,6 +471,26 @@ test("прямой P2P, лимит, смена режима и строгая о
     await expectDirectCandidates(page, 2);
     expect(p2pConnections.filter(isLiveKitConnection)).toEqual([]);
     expect(browserErrors).toEqual([]);
+
+    const viewerReconnectPeers = await nativePeerCount(viewers[0].page);
+    await dropLatestControlSocket(viewers[0].page);
+    await expect
+      .poll(() => nativePeerCount(viewers[0].page), { timeout: 30_000 })
+      .toBeGreaterThan(viewerReconnectPeers);
+    await expectDirectCandidates(viewers[0].page);
+    await expectDirectCandidates(page, 2);
+
+    const hostReconnectPeers = await Promise.all(
+      viewers.map(({ page: viewer }) => nativePeerCount(viewer)),
+    );
+    await dropLatestControlSocket(page);
+    for (const [index, { page: viewer }] of viewers.entries()) {
+      await expect
+        .poll(() => nativePeerCount(viewer), { timeout: 30_000 })
+        .toBeGreaterThan(hostReconnectPeers[index]);
+      await expectDirectCandidates(viewer);
+    }
+    await expectDirectCandidates(page, 2);
     const p2pTracks = await Promise.all(
       viewers.map(({ page: viewer }) =>
         viewer
@@ -454,7 +511,14 @@ test("прямой P2P, лимит, смена режима и строгая о
     });
     expect(overflow.status()).toBe(409);
 
+    await dropLatestControlSocket(viewers[0].page);
     await page.getByRole("button", { name: "Остановить трансляцию" }).click();
+    await expect(
+      viewers[0].page.getByText("Ведущий готовится к эфиру", { exact: true }),
+    ).toBeVisible({ timeout: 30_000 });
+    await expect(
+      viewers[0].page.getByRole("button", { name: "Смотреть эфир" }),
+    ).toHaveCount(0);
     for (const peerPage of [
       page,
       ...viewers.map(({ page: viewer }) => viewer),
@@ -532,6 +596,7 @@ test("прямой P2P, лимит, смена режима и строгая о
     await page.getByRole("button", { name: "Запустить снова" }).click();
     await expect(page.getByTitle("2 / 3 зрителей")).toBeVisible();
     await failedViewer.getByRole("button", { name: "Смотреть эфир" }).click();
+    await expect.poll(() => nativePeerCount(failedViewer)).toBeGreaterThan(0);
     await failedViewer.clock.runFor(20_100);
     await expect(
       failedViewer.getByText(/Сеть, NAT или firewall/),

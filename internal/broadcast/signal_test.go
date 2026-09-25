@@ -408,6 +408,13 @@ func TestSignalHostReconnectGraceAndViewerReservation(t *testing.T) {
 	ts := signalServer(t, s)
 	v, session := joinSignal(t, s, ts, id)
 	h, _ := startSignal(t, s, ts, id, secret, TransportP2P)
+	initialLease := <-timers
+	initialLease.mu.Lock()
+	initialStopped := initialLease.stopped
+	initialLease.mu.Unlock()
+	if !initialStopped {
+		t.Fatal("host authentication did not cancel initial lease")
+	}
 	readSignal(t, v, "broadcast-started")
 	sendSignal(t, v, clientSignal{Type: "peer-ready", Generation: 1})
 	readSignal(t, h, "peer-ready")
@@ -423,6 +430,10 @@ func TestSignalHostReconnectGraceAndViewerReservation(t *testing.T) {
 		t.Fatal(code, body)
 	}
 	h = authSignal(t, ts, id, body["ticket"].(string))
+	if snapshot := readSignal(t, v, "broadcast-started"); !snapshot.Resync {
+		t.Fatal("host reconnect did not reconcile viewer", snapshot)
+	}
+	sendSignal(t, v, clientSignal{Type: "peer-ready", Generation: 1})
 	if got := readSignal(t, h, "peer-ready"); got.Viewer != session {
 		t.Fatal(got)
 	}
@@ -455,6 +466,162 @@ func TestSignalHostReconnectGraceAndViewerReservation(t *testing.T) {
 	s.mu.Unlock()
 	if remaining := time.Until(expiry); remaining < 85*time.Second || remaining > 90*time.Second {
 		t.Fatal(remaining)
+	}
+}
+
+func TestInitialHostAuthenticationLeaseStopsGenerationWithWaitingViewer(t *testing.T) {
+	s, media, id, secret := createTest(t)
+	timers := make(chan *testSignalTimer, 2)
+	s.afterFunc = func(d time.Duration, f func()) signalTimer {
+		if d != 20*time.Second {
+			t.Errorf("lease = %v", d)
+		}
+		timer := &testSignalTimer{fire: f}
+		timers <- timer
+		return timer
+	}
+	ts := signalServer(t, s)
+	v, _ := joinSignal(t, s, ts, id)
+	code, _ := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/start", `{"hostSecret":"`+secret+`","transport":"server","viewerLimit":"10"}`)
+	if code != 200 {
+		t.Fatal(code)
+	}
+	readSignal(t, v, "broadcast-started")
+	var lease *testSignalTimer
+	select {
+	case lease = <-timers:
+	case <-time.After(time.Second):
+		t.Fatal("initial host-auth lease was not armed")
+	}
+	lease.fire()
+	readSignal(t, v, "broadcast-stopped")
+	lease.fire()
+	if len(media.deleted) != 1 || media.deleted[0] != "broadcast-"+id+"-1" {
+		t.Fatal(media.deleted)
+	}
+	if code, _ := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/start", `{"hostSecret":"`+secret+`","transport":"p2p","viewerLimit":"10"}`); code != 200 {
+		t.Fatalf("restart after expired lease = %d", code)
+	}
+}
+
+func TestViewerAndHostReauthenticationReconcileCurrentGeneration(t *testing.T) {
+	s, _, id, secret := createTest(t)
+	ts := signalServer(t, s)
+	v, session := joinSignal(t, s, ts, id)
+	h, generation := startSignal(t, s, ts, id, secret, TransportP2P)
+	started := readSignal(t, v, "broadcast-started")
+	if started.Resync {
+		t.Fatal("new generation was marked as resync")
+	}
+	sendSignal(t, v, clientSignal{Type: "peer-ready", Generation: generation})
+	readSignal(t, h, "peer-ready")
+
+	_ = v.CloseNow()
+	readSignal(t, h, "peer-left")
+	code, body := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/signal-ticket", `{"session":"`+session+`"}`)
+	if code != 200 {
+		t.Fatal(code, body)
+	}
+	v = authSignal(t, ts, id, body["ticket"].(string))
+	if snapshot := readSignal(t, v, "broadcast-started"); !snapshot.Resync || snapshot.Generation != generation {
+		t.Fatalf("viewer snapshot = %+v", snapshot)
+	}
+	sendSignal(t, v, clientSignal{Type: "peer-ready", Generation: generation})
+	readSignal(t, h, "peer-ready")
+
+	_ = h.CloseNow()
+	code, body = call(t, s.Handler(), "POST", "/api/rooms/"+id+"/signal-ticket", `{"hostSecret":"`+secret+`","generation":1}`)
+	if code != 200 {
+		t.Fatal(code, body)
+	}
+	h = authSignal(t, ts, id, body["ticket"].(string))
+	if snapshot := readSignal(t, v, "broadcast-started"); !snapshot.Resync || snapshot.Generation != generation {
+		t.Fatalf("host reconnect viewer snapshot = %+v", snapshot)
+	}
+	sendSignal(t, v, clientSignal{Type: "peer-ready", Generation: generation})
+	if ready := readSignal(t, h, "peer-ready"); ready.Viewer != session {
+		t.Fatal(ready)
+	}
+}
+
+func TestViewerReauthenticationReceivesStoppedSnapshot(t *testing.T) {
+	s, _, id, secret := createTest(t)
+	ts := signalServer(t, s)
+	v, session := joinSignal(t, s, ts, id)
+	_, _ = startSignal(t, s, ts, id, secret, TransportP2P)
+	readSignal(t, v, "broadcast-started")
+	if code, _ := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/stop", `{"hostSecret":"`+secret+`","generation":1}`); code != 200 {
+		t.Fatal(code)
+	}
+	readSignal(t, v, "broadcast-stopped")
+	_ = v.CloseNow()
+	code, body := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/signal-ticket", `{"session":"`+session+`"}`)
+	if code != 200 {
+		t.Fatal(code, body)
+	}
+	v = authSignal(t, ts, id, body["ticket"].(string))
+	if stopped := readSignal(t, v, "broadcast-stopped"); stopped.Generation != 1 {
+		t.Fatal(stopped)
+	}
+}
+
+func TestServerViewerRetryReturnsFreshSameGenerationConnection(t *testing.T) {
+	s, _, id, secret := createTest(t)
+	ts := signalServer(t, s)
+	v, _ := joinSignal(t, s, ts, id)
+	_, generation := startSignal(t, s, ts, id, secret, TransportServer)
+	initial := readSignal(t, v, "broadcast-started")
+	sendSignal(t, v, clientSignal{Type: "viewer-retry", Generation: generation})
+	retry := readSignal(t, v, "broadcast-started")
+	if !retry.Resync || retry.Generation != generation || retry.Transport != TransportServer || retry.LiveKit == nil || initial.LiveKit == nil || retry.LiveKit.Token == initial.LiveKit.Token {
+		t.Fatalf("initial=%+v retry=%+v", initial, retry)
+	}
+}
+
+func TestExplicitViewerLeaveReleasesSeatAndInvalidatesTickets(t *testing.T) {
+	s, _, id, secret := createTest(t)
+	ts := signalServer(t, s)
+	v, session := joinSignal(t, s, ts, id)
+	h, generation := startSignal(t, s, ts, id, secret, TransportP2P)
+	readSignal(t, v, "broadcast-started")
+	code, body := call(t, s.Handler(), "POST", "/api/rooms/"+id+"/signal-ticket", `{"session":"`+session+`"}`)
+	if code != 200 {
+		t.Fatal(code, body)
+	}
+	unusedTicket := body["ticket"].(string)
+	sendSignal(t, v, clientSignal{Type: "leave"})
+	if left := readSignal(t, h, "peer-left"); left.Viewer != session || left.Generation != generation {
+		t.Fatal(left)
+	}
+	s.mu.Lock()
+	_, reserved := s.rooms[id].Seats[session]
+	s.mu.Unlock()
+	if reserved {
+		t.Fatal("explicit leave retained seat")
+	}
+	stale := dialSignal(t, ts, id)
+	sendSignal(t, stale, clientSignal{Type: "authenticate", Ticket: unusedTicket})
+	expectPolicy(t, stale)
+}
+
+func TestStaleViewerSocketCannotReleaseReplacementSession(t *testing.T) {
+	s, _, id, _ := createTest(t)
+	s.mu.Lock()
+	room := s.rooms[id]
+	room.Seats["viewer-a"] = s.now().Add(90 * time.Second)
+	oldPeer := &signalPeer{auth: signalAuth{Role: "viewer", Session: "viewer-a"}}
+	currentPeer := &signalPeer{auth: signalAuth{Role: "viewer", Session: "viewer-a"}}
+	room.Peers["viewer-a"] = currentPeer
+	s.mu.Unlock()
+	if s.routeSignal(id, oldPeer, clientSignal{Type: "leave"}) {
+		t.Fatal("superseded viewer socket was accepted")
+	}
+	s.mu.Lock()
+	_, reserved := room.Seats["viewer-a"]
+	registered := room.Peers["viewer-a"] == currentPeer
+	s.mu.Unlock()
+	if !reserved || !registered {
+		t.Fatal("stale leave evicted replacement")
 	}
 }
 
@@ -589,6 +756,13 @@ func TestSignalServerHostGraceDeletesMediaAndStopsOnce(t *testing.T) {
 	ts := signalServer(t, s)
 	v, _ := joinSignal(t, s, ts, id)
 	h, _ := startSignal(t, s, ts, id, secret, TransportServer)
+	initialLease := <-timers
+	initialLease.mu.Lock()
+	initialStopped := initialLease.stopped
+	initialLease.mu.Unlock()
+	if !initialStopped {
+		t.Fatal("host authentication did not cancel initial lease")
+	}
 	readSignal(t, v, "broadcast-started")
 	_ = h.CloseNow()
 	var timer *testSignalTimer

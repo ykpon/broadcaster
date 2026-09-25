@@ -141,6 +141,23 @@ describe("viewer scene presentation", () => {
     });
   });
 
+  it("offers a same-generation retry after server media failure", () => {
+    expect(
+      viewerScene({
+        joined: true,
+        active: true,
+        transport: "server",
+        p2pFailed: false,
+        serverFailed: true,
+        ended: false,
+      }),
+    ).toEqual({
+      title: "Соединение с медиасервером потеряно",
+      subtitle: "Повторите подключение к текущему эфиру.",
+      action: "retry-server",
+    });
+  });
+
   it("explains that a direct P2P connection is being established", () => {
     expect(
       viewerScene({
@@ -248,6 +265,54 @@ describe("logical viewer session", () => {
     resolveJoin({ session: "viewer-a", ticket: "ticket" });
     await pending;
     expect(opened).toBe(false);
+  });
+
+  it("sends authenticated leave only for intentional departure", async () => {
+    const sent: object[] = [];
+    let closed = 0;
+    const session = createViewerSession({
+      roomId: "room-a",
+      readSession: () => "",
+      writeSession: () => {},
+      postJoin: async () => ({ session: "viewer-a", ticket: "ticket" }),
+      postTicket: async () => "next-ticket",
+      onAuthenticated: () => {},
+      onSignal: () => {},
+      onFatal: () => {},
+      makeSocket: () => ({
+        connect: () => {},
+        send: (signal) => sent.push(signal),
+        close: () => {
+          closed += 1;
+        },
+      }),
+    });
+    await session.join();
+    session.leave();
+    expect(sent).toEqual([{ type: "leave" }]);
+    expect(closed).toBe(1);
+
+    const unexpected = createViewerSession({
+      roomId: "room-a",
+      readSession: () => "",
+      writeSession: () => {},
+      postJoin: async () => ({ session: "viewer-b", ticket: "ticket" }),
+      postTicket: async () => "next-ticket",
+      onAuthenticated: () => {},
+      onSignal: () => {},
+      onFatal: () => {},
+      makeSocket: () => ({
+        connect: () => {},
+        send: (signal) => sent.push(signal),
+        close: () => {
+          closed += 1;
+        },
+      }),
+    });
+    await unexpected.join();
+    unexpected.close();
+    expect(sent).toEqual([{ type: "leave" }]);
+    expect(closed).toBe(2);
   });
 });
 

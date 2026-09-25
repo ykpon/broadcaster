@@ -16,6 +16,7 @@ import (
 type signalAuth struct {
 	Role, Session string
 	Generation    uint64
+	Resume        bool
 }
 
 type ticketRecord struct {
@@ -117,7 +118,7 @@ func (s *Server) signalTicket(w http.ResponseWriter, r *http.Request) {
 	if room == nil {
 		return
 	}
-	auth := signalAuth{Role: "viewer", Session: input.Session}
+	auth := signalAuth{Role: "viewer", Session: input.Session, Resume: true}
 	if input.HostSecret != "" {
 		hash := sha256.Sum256([]byte(input.HostSecret))
 		if input.Session != "" || subtle.ConstantTimeCompare(hash[:], room.Secret[:]) != 1 {
@@ -128,7 +129,7 @@ func (s *Server) signalTicket(w http.ResponseWriter, r *http.Request) {
 			problem(w, 409, "Запуск уже изменился")
 			return
 		}
-		auth = signalAuth{Role: "host", Generation: input.Generation}
+		auth = signalAuth{Role: "host", Generation: input.Generation, Resume: true}
 	} else {
 		s.expireSeats(room, s.now())
 		if _, ok := room.Seats[input.Session]; !ok || input.Generation != 0 {
@@ -370,10 +371,18 @@ func (s *Server) signal(w http.ResponseWriter, r *http.Request) {
 	s.countControlViewers(room)
 	p.send(serverSignal{Type: "authenticated", Generation: room.Generation, Viewer: auth.Session})
 	if auth.Role == "viewer" && room.Active {
-		p.send(s.startedMessage(room, auth.Session))
+		p.send(s.startedMessage(room, auth.Session, auth.Resume))
+	} else if auth.Role == "viewer" && auth.Resume {
+		p.send(serverSignal{Type: "broadcast-stopped", Generation: room.Generation})
 	} else if auth.Role == "host" && room.Transport == TransportP2P {
 		for _, viewer := range room.Peers {
-			if viewer.auth.Role == "viewer" && viewer.readyGeneration == room.Generation {
+			if viewer.auth.Role != "viewer" {
+				continue
+			}
+			if auth.Resume {
+				viewer.readyGeneration = 0
+				viewer.send(s.startedMessage(room, viewer.auth.Session, true))
+			} else if viewer.readyGeneration == room.Generation {
 				p.send(serverSignal{Type: "peer-ready", Generation: room.Generation, Viewer: viewer.auth.Session})
 			}
 		}
@@ -414,7 +423,21 @@ func (s *Server) routeSignal(id string, p *signalPeer, message clientSignal) boo
 	if message.Type == "authenticate" {
 		return false
 	}
+	if message.Type == "leave" {
+		if p.auth.Role != "viewer" || message.Generation != 0 || message.Viewer != "" {
+			return false
+		}
+		s.leaveViewerLocked(room, p)
+		return true
+	}
 	if !room.Active || message.Generation != room.Generation || (p.auth.Role == "host" && p.auth.Generation != room.Generation) {
+		return true
+	}
+	if message.Type == "viewer-retry" {
+		if p.auth.Role != "viewer" || room.Transport != TransportServer || message.Viewer != "" {
+			return false
+		}
+		p.send(s.startedMessage(room, p.auth.Session, true))
 		return true
 	}
 	if p.auth.Role == "viewer" && message.Viewer != "" && message.Viewer != p.auth.Session {
@@ -510,6 +533,30 @@ func (s *Server) removePeer(id string, p *signalPeer) {
 	}
 }
 
+// Caller holds mu. Only the currently registered authenticated viewer can
+// release the logical seat, so a delayed leave from a superseded socket is
+// harmless.
+func (s *Server) leaveViewerLocked(room *Room, p *signalPeer) {
+	if room.Peers[p.auth.Session] != p {
+		return
+	}
+	delete(room.Peers, p.auth.Session)
+	delete(room.Seats, p.auth.Session)
+	for hash, ticket := range room.Tickets {
+		if ticket.Auth.Role == "viewer" && ticket.Auth.Session == p.auth.Session {
+			delete(room.Tickets, hash)
+		}
+	}
+	if len(room.Peers) == 0 {
+		room.EmptySince = s.now()
+	}
+	s.countControlViewers(room)
+	if host := room.Peers["host"]; host != nil && room.Active && room.Transport == TransportP2P {
+		host.send(serverSignal{Type: "peer-left", Generation: room.Generation, Viewer: p.auth.Session})
+	}
+	p.close(websocket.StatusNormalClosure)
+}
+
 func (s *Server) hostGraceExpired(id string, generation uint64, grace *hostGrace) {
 	s.mu.Lock()
 	room := s.rooms[id]
@@ -535,6 +582,16 @@ func (s *Server) cancelHostGrace(room *Room) {
 	}
 }
 
+func (s *Server) armHostGrace(room *Room) {
+	s.cancelHostGrace(room)
+	grace := &hostGrace{}
+	id, generation := room.ID, room.Generation
+	room.HostGrace = grace
+	grace.timer = s.afterFunc(20*time.Second, func() {
+		s.hostGraceExpired(id, generation, grace)
+	})
+}
+
 func (s *Server) countControlViewers(room *Room) {
 	room.Viewers = 0
 	for _, p := range room.Peers {
@@ -544,8 +601,8 @@ func (s *Server) countControlViewers(room *Room) {
 	}
 }
 
-func (s *Server) startedMessage(room *Room, session string) serverSignal {
-	message := serverSignal{Type: "broadcast-started", Generation: room.Generation, Transport: room.Transport, ViewerLimit: room.ViewerLimit.String()}
+func (s *Server) startedMessage(room *Room, session string, resync bool) serverSignal {
+	message := serverSignal{Type: "broadcast-started", Generation: room.Generation, Resync: resync, Transport: room.Transport, ViewerLimit: room.ViewerLimit.String()}
 	if room.Transport == TransportP2P {
 		message.IceServers = []IceServer{{URLs: []string{s.STUNURL}}}
 	} else {
@@ -557,7 +614,7 @@ func (s *Server) startedMessage(room *Room, session string) serverSignal {
 func (s *Server) notifyStarted(room *Room) {
 	for _, p := range room.Peers {
 		if p.auth.Role == "viewer" {
-			p.send(s.startedMessage(room, p.auth.Session))
+			p.send(s.startedMessage(room, p.auth.Session, false))
 		}
 	}
 }

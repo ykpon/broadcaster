@@ -54,13 +54,15 @@ export function viewerErrorPresentation(
   return visibleViewerError(failure, roomError);
 }
 
-export type ViewerSceneAction = "join" | "retry-p2p" | "create-room" | null;
+export type ViewerSceneAction =
+  "join" | "retry-p2p" | "retry-server" | "create-room" | null;
 
 export type ViewerSceneInput = {
   joined: boolean;
   active: boolean;
   transport: TransportMode | undefined;
   p2pFailed: boolean;
+  serverFailed?: boolean;
   ended: boolean;
 };
 
@@ -69,6 +71,7 @@ export function viewerScene({
   active,
   transport,
   p2pFailed,
+  serverFailed = false,
   ended,
 }: ViewerSceneInput): {
   title: string;
@@ -100,6 +103,12 @@ export function viewerScene({
       subtitle:
         "Сеть, NAT или firewall не пропускают P2P. Повторите попытку или попросите ведущего запустить эфир через сервер.",
       action: "retry-p2p",
+    };
+  if (transport === "server" && serverFailed)
+    return {
+      title: "Соединение с медиасервером потеряно",
+      subtitle: "Повторите подключение к текущему эфиру.",
+      action: "retry-server",
     };
   if (transport === "p2p")
     return {
@@ -170,6 +179,13 @@ export function createViewerSession(options: ViewerSessionOptions) {
       socket?.send(signal),
     close() {
       if (disposed) return;
+      disposed = true;
+      socket?.close();
+      socket = undefined;
+    },
+    leave() {
+      if (disposed) return;
+      socket?.send({ type: "leave" });
       disposed = true;
       socket?.close();
       socket = undefined;

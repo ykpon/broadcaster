@@ -119,6 +119,52 @@ afterEach(() => {
 });
 
 describe("P2P publisher lifecycle", () => {
+  it("closes a peer when synchronous transceiver setup fails", async () => {
+    class ThrowingPeer extends FakePeer {
+      override addTransceiver(
+        _track: MediaStreamTrack,
+        _options: RTCRtpTransceiverInit,
+      ): never {
+        throw new Error("setup failed");
+      }
+    }
+    const send = vi.fn();
+    const stream = {
+      getVideoTracks: () => [{ kind: "video" }],
+      getAudioTracks: () => [],
+    } as unknown as MediaStream;
+    const publisher = createP2PPublisher(
+      { onPeerCountsChanged: vi.fn() },
+      {
+        RTCPeerConnection: ThrowingPeer as unknown as typeof RTCPeerConnection,
+        getSenderCapabilities: () =>
+          ({ codecs: [] }) as unknown as RTCRtpCapabilities,
+        createNegotiationId: () => "attempt-1",
+      },
+    );
+    await publisher.start({
+      generation: 7,
+      stream,
+      settings: DEFAULT_STREAM_SETTINGS,
+      iceServers: [],
+      send,
+    });
+
+    await expect(
+      publisher.handleSignal({
+        type: "peer-ready",
+        generation: 7,
+        viewer: "viewer-a",
+      }),
+    ).resolves.toBeUndefined();
+    expect(FakePeer.instances[0].close).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith({
+      type: "peer-failed",
+      generation: 7,
+      viewer: "viewer-a",
+    });
+  });
+
   it("offers with send-only tracks, preferred codec, and local description before signaling", async () => {
     const { publisher, start, send, video, audio } = fixture();
     await start();

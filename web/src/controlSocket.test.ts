@@ -246,6 +246,28 @@ describe("control socket", () => {
     expect(harness.events.map((event) => event.generation)).toEqual([2]);
   });
 
+  it("does not let connect race a pending reconnect ticket request", async () => {
+    let resolveTicket!: (ticket: string) => void;
+    const getTicket = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveTicket = resolve;
+        }),
+    );
+    const harness = socketHarness({ getTicket });
+    harness.control.connect("ticket-1");
+    harness.sockets[0].emitClose();
+    await harness.fireNextTimer();
+
+    harness.control.connect("competing-ticket");
+    expect(harness.sockets).toHaveLength(1);
+
+    resolveTicket("ticket-2");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(harness.sockets).toHaveLength(2);
+  });
+
   it("closes the socket, cancels reconnects, and never flushes queued messages", () => {
     const harness = socketHarness();
     harness.control.connect("ticket-1");

@@ -58,6 +58,8 @@ export function createControlSocket(
   let socket: WebSocketLike | undefined;
   let writableSocket: WebSocketLike | undefined;
   let reconnectTimer: unknown;
+  let ticketRequest = 0;
+  let ticketPending = false;
   let reconnectAttempts = 0;
   let highestGeneration = 0;
   let disposed = false;
@@ -80,7 +82,20 @@ export function createControlSocket(
     reconnectTimer = schedule(() => {
       reconnectTimer = undefined;
       reconnectAttempts += 1;
-      void options.getTicket().then(openSocket, () => scheduleReconnect());
+      ticketPending = true;
+      const request = ++ticketRequest;
+      void options.getTicket().then(
+        (ticket) => {
+          if (disposed || request !== ticketRequest) return;
+          ticketPending = false;
+          openSocket(ticket);
+        },
+        () => {
+          if (disposed || request !== ticketRequest) return;
+          ticketPending = false;
+          scheduleReconnect();
+        },
+      );
     }, delay);
   };
 
@@ -146,7 +161,12 @@ export function createControlSocket(
 
   return {
     connect(ticket) {
-      if (disposed || socket !== undefined || reconnectTimer !== undefined)
+      if (
+        disposed ||
+        socket !== undefined ||
+        reconnectTimer !== undefined ||
+        ticketPending
+      )
         return;
       openSocket(ticket);
     },
@@ -162,6 +182,8 @@ export function createControlSocket(
     close() {
       if (disposed) return;
       disposed = true;
+      ticketRequest += 1;
+      ticketPending = false;
       queue = [];
       if (reconnectTimer !== undefined) {
         cancel(reconnectTimer);

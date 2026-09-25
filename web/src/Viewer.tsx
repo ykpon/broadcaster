@@ -124,10 +124,15 @@ export default function Viewer({ id }: { id: string }) {
     mounted.current = true;
     return () => {
       mounted.current = false;
-      sessionRef.current?.close();
+      sessionRef.current?.leave();
       controllerRef.current?.dispose();
       resetRemoteState(false);
     };
+  }, []);
+  useEffect(() => {
+    const leave = () => sessionRef.current?.leave();
+    window.addEventListener("pagehide", leave);
+    return () => window.removeEventListener("pagehide", leave);
   }, []);
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
@@ -217,7 +222,7 @@ export default function Viewer({ id }: { id: string }) {
   async function join() {
     setBusy(true);
     updateFailure({ type: "clear" });
-    sessionRef.current?.close();
+    sessionRef.current?.leave();
     controllerRef.current?.dispose();
     resetRemoteState();
     setBlocked(false);
@@ -391,6 +396,10 @@ export default function Viewer({ id }: { id: string }) {
     active: broadcastActive,
     transport,
     p2pFailed: transport === "p2p" && state === "failed",
+    serverFailed:
+      transport === "server" &&
+      state === "failed" &&
+      failure?.scope === "transport",
     ended,
   });
   const transportStatus =
@@ -404,7 +413,7 @@ export default function Viewer({ id }: { id: string }) {
       <Header>
         <span className="pill">
           <Users size={14} />
-          {info?.viewers || 0} / 10 зрителей
+          {info?.viewers || 0} / {info?.viewerLimit || "10"} зрителей
         </span>
         <span className={`status-pill ${hasVideo ? "on" : ""}`}>
           <span className="dot" />
@@ -462,6 +471,14 @@ export default function Viewer({ id }: { id: string }) {
                     onClick={() => controllerRef.current?.retryP2P()}
                   >
                     <RefreshCw size={18} /> Повторить P2P-подключение
+                  </button>
+                )}
+                {presentation.action === "retry-server" && (
+                  <button
+                    className="primary"
+                    onClick={() => controllerRef.current?.retryServer()}
+                  >
+                    <RefreshCw size={18} /> Повторить подключение
                   </button>
                 )}
                 {presentation.action === "create-room" && (

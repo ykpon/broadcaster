@@ -170,30 +170,46 @@ export function createP2PPublisher(
     closePeer(viewer);
     failedViewers.delete(viewer);
 
-    const connection = new dependencies.RTCPeerConnection({
-      iceServers: input.iceServers ?? [],
-    });
-    const negotiationId = dependencies.createNegotiationId();
-    const videoTrack = input.stream.getVideoTracks()[0];
-    const audioTrack = input.stream.getAudioTracks()[0];
-    const videoTransceiver = videoTrack
-      ? connection.addTransceiver(videoTrack, {
-          direction: "sendonly",
-          streams: [input.stream],
-        })
-      : undefined;
-    const audioTransceiver = audioTrack
-      ? connection.addTransceiver(audioTrack, {
-          direction: "sendonly",
-          streams: [input.stream],
-        })
-      : undefined;
-    const codecs = preferredCodecs(
-      dependencies.getSenderCapabilities("video"),
-      input.settings.codec,
-    );
-    if (videoTransceiver && codecs.length > 0)
-      videoTransceiver.setCodecPreferences(codecs);
+    let connection: RTCPeerConnection | undefined;
+    let negotiationId: string;
+    let videoTransceiver: RTCRtpTransceiver | undefined;
+    let audioTransceiver: RTCRtpTransceiver | undefined;
+    try {
+      connection = new dependencies.RTCPeerConnection({
+        iceServers: input.iceServers ?? [],
+      });
+      negotiationId = dependencies.createNegotiationId();
+      const videoTrack = input.stream.getVideoTracks()[0];
+      const audioTrack = input.stream.getAudioTracks()[0];
+      videoTransceiver = videoTrack
+        ? connection.addTransceiver(videoTrack, {
+            direction: "sendonly",
+            streams: [input.stream],
+          })
+        : undefined;
+      audioTransceiver = audioTrack
+        ? connection.addTransceiver(audioTrack, {
+            direction: "sendonly",
+            streams: [input.stream],
+          })
+        : undefined;
+      const codecs = preferredCodecs(
+        dependencies.getSenderCapabilities("video"),
+        input.settings.codec,
+      );
+      if (videoTransceiver && codecs.length > 0)
+        videoTransceiver.setCodecPreferences(codecs);
+    } catch {
+      connection?.close();
+      failedViewers.add(viewer);
+      input.send({
+        type: "peer-failed",
+        generation: input.generation,
+        viewer,
+      });
+      notifyCounts();
+      return;
+    }
 
     const state: PeerState = {
       connection,

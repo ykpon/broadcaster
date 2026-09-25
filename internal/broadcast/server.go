@@ -36,6 +36,7 @@ type Room struct {
 	Tickets                    map[[32]byte]ticketRecord `json:"-"`
 	Peers                      map[string]*signalPeer    `json:"-"`
 	HostGrace                  *hostGrace                `json:"-"`
+	PrepareOwner               string                    `json:"-"`
 	Controlled                 bool                      `json:"-"`
 }
 type bucket struct {
@@ -232,7 +233,7 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		s.mu.Unlock()
 		return StartResponse{}, 410, "Эфир завершён"
 	}
-	if room.Active {
+	if room.Active || room.PrepareOwner != "" {
 		s.mu.Unlock()
 		return StartResponse{}, 409, "Эфир уже запущен"
 	}
@@ -247,6 +248,8 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		return StartResponse{}, 409, "Лимит зрителей меньше занятых мест"
 	}
 	nextGeneration := generation + 1
+	prepareOwner := randomID()
+	room.PrepareOwner = prepareOwner
 	mediaRoom := ""
 	if transport == TransportServer {
 		mediaRoom = "broadcast-" + id + "-" + strconv.FormatUint(nextGeneration, 10)
@@ -255,6 +258,11 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 
 	if mediaRoom != "" {
 		if err := s.media.Create(ctx, mediaRoom); err != nil {
+			s.mu.Lock()
+			if room := s.rooms[id]; room != nil && room.PrepareOwner == prepareOwner {
+				room.PrepareOwner = ""
+			}
+			s.mu.Unlock()
 			log.Print(err)
 			return StartResponse{}, 503, "Медиасервер недоступен. Попробуйте ещё раз."
 		}
@@ -262,7 +270,10 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 
 	s.mu.Lock()
 	room = s.rooms[id]
-	if room == nil || room.State == "ended" || room.Active || room.Generation != generation || len(room.Seats) != occupied || !limit.Allows(len(room.Seats)) {
+	if room == nil || room.State == "ended" || room.Active || room.PrepareOwner != prepareOwner || room.Generation != generation || len(room.Seats) != occupied || !limit.Allows(len(room.Seats)) {
+		if room != nil && room.PrepareOwner == prepareOwner {
+			room.PrepareOwner = ""
+		}
 		s.mu.Unlock()
 		if mediaRoom != "" {
 			if err := s.media.Delete(ctx, mediaRoom); err != nil {
@@ -272,6 +283,7 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 		return StartResponse{}, 409, "Конфигурация комнаты изменилась. Повторите запрос."
 	}
 	oldMediaRoom := room.MediaRoom
+	room.PrepareOwner = ""
 	room.Generation = nextGeneration
 	room.Transport = transport
 	room.ViewerLimit = limit
@@ -281,6 +293,7 @@ func (s *Server) startRoom(ctx context.Context, id, secret string, transport Tra
 	room.Deleted = false
 	response := StartResponse{Generation: room.Generation, Transport: room.Transport}
 	response.Ticket = s.issueTicketLocked(room, signalAuth{Role: "host", Generation: room.Generation})
+	s.armHostGrace(room)
 	if transport == TransportP2P {
 		response.IceServers = []IceServer{{URLs: []string{s.STUNURL}}}
 	} else {

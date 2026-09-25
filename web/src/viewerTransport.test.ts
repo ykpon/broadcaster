@@ -3,14 +3,18 @@ import { RoomEvent, Track } from "livekit-client";
 import type { BroadcastStartedSignal, ServerSignal } from "./protocol";
 import { createViewerTransportController } from "./viewerTransport";
 
-const p2p = (generation: number): BroadcastStartedSignal => ({
+const p2p = (
+  generation: number,
+): Extract<BroadcastStartedSignal, { transport: "p2p" }> => ({
   type: "broadcast-started",
   generation,
   transport: "p2p",
   viewerLimit: "10",
   iceServers: [{ urls: ["stun:localhost:3478"] }],
 });
-const server = (generation: number): BroadcastStartedSignal => ({
+const server = (
+  generation: number,
+): Extract<BroadcastStartedSignal, { transport: "server" }> => ({
   type: "broadcast-started",
   generation,
   transport: "server",
@@ -200,9 +204,8 @@ describe("viewer transport switching", () => {
     expect(rooms[1].connect).toHaveBeenCalledWith("ws://media", "token-3");
   });
 
-  it("stops media without changing the caller's logical joined state", async () => {
+  it("stops all media for the stopped generation", async () => {
     const { controller, rooms, onTrackRemoved } = harness();
-    const joined = true;
     await controller.switchTo(server(1));
     const track = {
       kind: Track.Kind.Video,
@@ -214,7 +217,6 @@ describe("viewer transport switching", () => {
     controller.stopGeneration(1);
     expect(onTrackRemoved).toHaveBeenCalledWith(track);
     expect(rooms[0].disconnect).toHaveBeenCalledTimes(1);
-    expect(joined).toBe(true);
   });
 
   it("rejects stale server callbacks and stale P2P attempt signals after retry", async () => {
@@ -269,6 +271,66 @@ describe("viewer transport switching", () => {
     expect(peers[1].setRemoteDescription).not.toHaveBeenCalled();
     expect(peers[1].addIceCandidate).not.toHaveBeenCalled();
     expect(peers[1].close).not.toHaveBeenCalled();
+  });
+
+  it("replaces P2P media on an authoritative same-generation resync", async () => {
+    const { controller, peers, send } = harness();
+    await controller.switchTo(p2p(2));
+    await controller.handleSignal(
+      signal({
+        type: "offer",
+        generation: 2,
+        viewer: "viewer-a",
+        negotiationId: "old-attempt",
+        sdp: "old-offer",
+      }),
+    );
+
+    await controller.handleSignal({ ...p2p(2), resync: true });
+    expect(peers).toHaveLength(2);
+    expect(peers[0].close).toHaveBeenCalledTimes(1);
+    expect(
+      send.mock.calls.filter(([event]) => event.type === "peer-ready"),
+    ).toHaveLength(2);
+
+    await controller.handleSignal(
+      signal({
+        type: "offer",
+        generation: 2,
+        viewer: "viewer-a",
+        negotiationId: "new-attempt",
+        sdp: "new-offer",
+      }),
+    );
+    expect(peers[1].setRemoteDescription).toHaveBeenCalledWith({
+      type: "offer",
+      sdp: "new-offer",
+    });
+  });
+
+  it("requests fresh server connection data after connect or terminal disconnect failure", async () => {
+    const { controller, rooms, send, onError } = harness();
+    await controller.switchTo(server(1));
+    rooms[0].emit(RoomEvent.Disconnected);
+    expect(onError).toHaveBeenCalledWith(expect.stringMatching(/медиасервер/i));
+
+    controller.retryServer();
+    expect(send).toHaveBeenCalledWith({
+      type: "viewer-retry",
+      generation: 1,
+    });
+
+    await controller.handleSignal({
+      ...server(1),
+      resync: true,
+      livekit: { url: "ws://media", token: "fresh-token" },
+    });
+    expect(rooms).toHaveLength(2);
+    expect(rooms[1].connect).toHaveBeenCalledWith("ws://media", "fresh-token");
+
+    controller.stopGeneration(1);
+    rooms[1].emit(RoomEvent.Disconnected);
+    expect(onError).toHaveBeenCalledTimes(1);
   });
 
   it("ignores a server connect that finishes after a new generation starts", async () => {

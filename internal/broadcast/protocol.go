@@ -58,6 +58,7 @@ type clientSignal struct {
 type serverSignal struct {
 	Type          string             `json:"type"`
 	Generation    uint64             `json:"generation,omitempty"`
+	Resync        bool               `json:"resync,omitempty"`
 	Transport     Transport          `json:"transport,omitempty"`
 	Viewer        string             `json:"viewer,omitempty"`
 	NegotiationID string             `json:"negotiationId,omitempty"`

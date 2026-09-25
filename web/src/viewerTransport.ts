@@ -14,6 +14,8 @@ import type { ControlSocketSignal } from "./controlSocket";
 
 export const P2P_CONNECTION_ERROR =
   "Сеть, NAT или firewall не пропускают P2P. Повторите попытку или попросите ведущего запустить эфир через сервер.";
+export const SERVER_CONNECTION_ERROR =
+  "Соединение с медиасервером потеряно. Повторите подключение к текущему эфиру.";
 
 export type ViewerMediaTrack = {
   kind: Track.Kind;
@@ -89,6 +91,7 @@ export function createViewerTransportController(
   let latestGeneration = 0;
   let disposed = false;
   let lastP2P: { generation: number; iceServers: RTCIceServer[] } | undefined;
+  let lastServerGeneration: number | undefined;
   const retiredAttempts = new Set<string>();
 
   const current = (state: State) =>
@@ -124,6 +127,13 @@ export function createViewerTransportController(
       generation: state.generation,
       ...(negotiationId ? { negotiationId } : {}),
     });
+  };
+
+  const failServer = (state: ServerState) => {
+    if (!current(state)) return;
+    clearActive();
+    options.onState("failed");
+    options.onError(SERVER_CONNECTION_ERROR);
   };
 
   const startP2P = (generation: number, iceServers: RTCIceServer[]) => {
@@ -218,14 +228,21 @@ export function createViewerTransportController(
 
   return {
     async switchTo(event: BroadcastStartedSignal) {
-      if (disposed || event.generation <= latestGeneration) return;
+      if (
+        disposed ||
+        event.generation < latestGeneration ||
+        (event.generation === latestGeneration && !event.resync)
+      )
+        return;
       latestGeneration = event.generation;
       clearActive();
       if (event.transport === "p2p") {
+        lastServerGeneration = undefined;
         startP2P(event.generation, event.iceServers);
         return;
       }
       lastP2P = undefined;
+      lastServerGeneration = event.generation;
       const room = new RoomClass({ adaptiveStream: false });
       const state: ServerState = {
         kind: "server",
@@ -248,10 +265,7 @@ export function createViewerTransportController(
         options.onTrackRemoved(track);
       });
       room.on(RoomEvent.Disconnected, () => {
-        if (!current(state)) return;
-        for (const track of state.tracks) options.onTrackRemoved(track);
-        state.tracks.clear();
-        options.onState(ConnectionState.Disconnected);
+        failServer(state);
       });
       options.onState(ConnectionState.Connecting);
       try {
@@ -261,14 +275,7 @@ export function createViewerTransportController(
           if (current(state)) options.onPlaybackBlocked();
         });
       } catch (error) {
-        if (current(state)) {
-          clearActive();
-          options.onError(
-            error instanceof Error
-              ? error.message
-              : "Не удалось подключиться к медиасерверу",
-          );
-        }
+        if (current(state)) failServer(state);
       }
     },
     async handleSignal(event: ServerSignal) {
@@ -338,11 +345,24 @@ export function createViewerTransportController(
       if (state) clearActive();
       startP2P(target.generation, target.iceServers);
     },
+    retryServer() {
+      if (
+        disposed ||
+        lastServerGeneration === undefined ||
+        lastServerGeneration !== latestGeneration
+      )
+        return;
+      options.send({
+        type: "viewer-retry",
+        generation: lastServerGeneration,
+      });
+    },
     stopGeneration(generation: number) {
       if (disposed || generation < latestGeneration) return;
       latestGeneration = generation;
       if (active && active.generation <= generation) clearActive();
       lastP2P = undefined;
+      lastServerGeneration = undefined;
       options.onState(ConnectionState.Disconnected);
     },
     async startAudio() {
@@ -354,6 +374,7 @@ export function createViewerTransportController(
       if (disposed) return;
       disposed = true;
       lastP2P = undefined;
+      lastServerGeneration = undefined;
       clearActive();
     },
   };
