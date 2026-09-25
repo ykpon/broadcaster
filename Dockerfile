@@ -8,7 +8,7 @@ RUN pnpm test && pnpm run build
 
 FROM golang:1.26-alpine AS server
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 RUN go test ./... && go vet ./... && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /broadcast ./cmd/server
@@ -20,5 +20,6 @@ COPY --from=server /broadcast /app/broadcast
 COPY --from=web /src/web/dist /app/web/dist
 USER app
 EXPOSE 8080
+EXPOSE 3478/udp
 HEALTHCHECK --interval=10s --timeout=3s --start-period=40s CMD ["/app/broadcast", "healthcheck"]
 ENTRYPOINT ["/app/broadcast"]

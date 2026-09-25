@@ -9,7 +9,6 @@ rtc:
   enable_loopback_candidate: true
 room:
   auto_create: false
-  max_participants: 11
   empty_timeout: 1800
   departure_timeout: 60
 logging:

@@ -1,9 +1,4 @@
-export type RoomInfo = {
-  roomId: string;
-  state: "waiting" | "live" | "ended";
-  viewers: number;
-};
-export type Connection = { token: string; url: string; session?: string };
+export type { RoomInfo } from "./protocol";
 export async function api<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`/api${path}`, {
     method: body === undefined ? "GET" : "POST",

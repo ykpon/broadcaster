@@ -35,7 +35,7 @@ type LiveKit struct {
 
 func (l *LiveKit) sign(identity string, grants map[string]any) string {
 	now := time.Now()
-	payload, _ := json.Marshal(map[string]any{"iss": l.Key, "sub": identity, "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(time.Minute).Unix(), "video": grants})
+	payload, _ := json.Marshal(map[string]any{"iss": l.Key, "sub": identity, "jti": randomID(), "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(time.Minute).Unix(), "video": grants})
 	enc := base64.RawURLEncoding
 	data := enc.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + enc.EncodeToString(payload)
 	mac := hmac.New(sha256.New, []byte(l.Secret))
@@ -79,7 +79,7 @@ func (l *LiveKit) rpc(ctx context.Context, method, room string, body, output any
 	return nil
 }
 func (l *LiveKit) Create(ctx context.Context, name string) error {
-	return l.rpc(ctx, "CreateRoom", name, map[string]any{"name": name, "max_participants": 11, "empty_timeout": 7200, "departure_timeout": 60}, nil)
+	return l.rpc(ctx, "CreateRoom", name, map[string]any{"name": name, "max_participants": 0, "empty_timeout": 7200, "departure_timeout": 60}, nil)
 }
 func (l *LiveKit) Delete(ctx context.Context, name string) error {
 	return l.rpc(ctx, "DeleteRoom", name, map[string]string{"room": name}, nil)

@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { Room, RoomEvent, ConnectionState, Track } from "livekit-client";
 import {
   Monitor,
   Check,
@@ -19,7 +18,7 @@ import {
 } from "lucide-react";
 import { Header, ErrorBox, CopyButton, Scene } from "./shared";
 import { useRoomInfo, roomStateLabel } from "./room";
-import { api, message, type Connection } from "./api";
+import { api, message } from "./api";
 import {
   RESOLUTION_STEPS,
   SETTING_RANGES,
@@ -28,18 +27,23 @@ import {
   qualityBalanceLabel,
   type StreamSettings,
 } from "./quality";
+import { applyQuality, displayCaptureOptions } from "./media";
+import { createControlSocket, type ControlSocket } from "./controlSocket";
 import {
-  applyQuality,
-  displayCaptureOptions,
-  publishScreen,
-  updateQuality,
-  type QualityUpdateResult,
-  type PublishedTracks,
-} from "./media";
+  normalizeViewerLimit,
+  type BroadcastConfig,
+  type TransportMode,
+} from "./protocol";
+import {
+  createLiveKitPublisher,
+  type PublisherQualityUpdateResult,
+  type StudioPublisher,
+  type RTCStatsProvider,
+} from "./studioTransport";
+import { createP2PPublisher, type P2PSignaling } from "./p2pPublisher";
 import {
   formatLimitation,
   formatMetric,
-  parseOutboundStats,
   streamHealth,
   type CounterSample,
   type StreamMetrics,
@@ -48,8 +52,13 @@ import {
   createLatestSettingsUpdater,
   createStatsSessionGuard,
   formatCaptureFrameRate,
+  loadBroadcastConfigSafely,
   loadStreamSettingsSafely,
+  readPublisherMetrics,
+  saveBroadcastConfigSafely,
   saveStreamSettingsSafely,
+  startStudioBroadcast,
+  stopStudioBroadcast,
 } from "./studioRuntime";
 
 type NumericSetting =
@@ -61,6 +70,9 @@ const sameSettings = (left: StreamSettings, right: StreamSettings) =>
   left.audioBitrateKbps === right.audioBitrateKbps &&
   left.balance === right.balance &&
   left.codec === right.codec;
+type ActivePublisher = StudioPublisher & Partial<P2PSignaling>;
+const transportLabel = (transport: TransportMode) =>
+  transport === "p2p" ? "P2P — напрямую" : "Через сервер";
 
 export default function Studio({ id }: { id: string }) {
   const { info, error: infoError } = useRoomInfo(id);
@@ -70,6 +82,11 @@ export default function Studio({ id }: { id: string }) {
   const [settings, setSettings] = useState<StreamSettings>(() =>
       loadStreamSettingsSafely(() => window.localStorage),
     ),
+    [broadcastConfig, setBroadcastConfig] = useState<BroadcastConfig>(() =>
+      loadBroadcastConfigSafely(() => window.localStorage),
+    ),
+    [activeConfig, setActiveConfig] = useState<BroadcastConfig | null>(null),
+    [limitError, setLimitError] = useState(""),
     [appliedSettings, setAppliedSettings] = useState(settings),
     [busy, setBusy] = useState(false),
     [qualityBusy, setQualityBusy] = useState(false),
@@ -81,54 +98,49 @@ export default function Studio({ id }: { id: string }) {
     [muted, setMuted] = useState(false),
     [hasAudio, setHasAudio] = useState(false),
     [surface, setSurface] = useState(""),
-    [state, setState] = useState(ConnectionState.Disconnected),
+    [state, setState] = useState("disconnected"),
     [captureVideo, setCaptureVideo] = useState(""),
     [captureAudio, setCaptureAudio] = useState(""),
     [videoMetrics, setVideoMetrics] = useState<StreamMetrics>({}),
     [audioMetrics, setAudioMetrics] = useState<StreamMetrics>({}),
+    [peerCounts, setPeerCounts] = useState({ connected: 0, failed: 0 }),
     [elapsed, setElapsed] = useState(0);
-  const roomRef = useRef<Room | null>(null),
+  const publisherRef = useRef<ActivePublisher | null>(null),
+    controlRef = useRef<ControlSocket | null>(null),
+    generationRef = useRef<number | null>(null),
     streamRef = useRef<MediaStream | null>(null),
     confirmedSettings = useRef(settings),
-    tracksRef = useRef<PublishedTracks | null>(null),
     preview = useRef<HTMLVideoElement>(null),
     started = useRef(0),
     ending = useRef(false),
     stopping = useRef(false),
     previousVideoSample = useRef<CounterSample | undefined>(undefined),
     previousAudioSample = useRef<CounterSample | undefined>(undefined),
+    startAttempt = useRef(0),
+    cancelControlAuthentication = useRef<(() => void) | null>(null),
     mounted = useRef(true);
   const statsSessionGuard = useRef(
-    createStatsSessionGuard<object | undefined>(),
+    createStatsSessionGuard<RTCStatsProvider | undefined>(),
   ).current;
   const [settingsUpdater] = useState(() =>
-    createLatestSettingsUpdater<StreamSettings, QualityUpdateResult>({
+    createLatestSettingsUpdater<StreamSettings, PublisherQualityUpdateResult>({
       apply: (next) => {
-        const room = roomRef.current;
-        const tracks = tracksRef.current;
-        if (!room || !tracks) return Promise.reject(new Error("Эфир завершён"));
-        return updateQuality(room, tracks, confirmedSettings.current, next);
+        const publisher = publisherRef.current;
+        if (!publisher) return Promise.reject(new Error("Эфир завершён"));
+        return publisher.updateSettings(confirmedSettings.current, next);
       },
       rollback: (confirmed, failed) => {
-        const room = roomRef.current;
-        const tracks = tracksRef.current;
-        if (!room || !tracks) return Promise.resolve();
-        return updateQuality(room, tracks, failed, confirmed);
+        const publisher = publisherRef.current;
+        if (!publisher) return Promise.resolve();
+        return publisher.updateSettings(failed, confirmed);
       },
       readConfirmed: () => confirmedSettings.current,
       equals: sameSettings,
       onBusy: setQualityBusy,
       onStart: () => setError(""),
-      onApplied: (next, result) => {
-        tracksRef.current = result.tracks;
-        if (result.videoRepublished) resetStats();
+      onApplied: (next) => {
         confirmedSettings.current = next;
         setAppliedSettings(next);
-      },
-      onRolledBack: (_confirmed, result) => {
-        if (!result) return;
-        tracksRef.current = result.tracks;
-        if (result.videoRepublished) resetStats();
       },
       onSuccess: (_next, result) => setNote(result.note),
       onFailure: (failure, confirmed, shouldRestoreDraft) => {
@@ -157,12 +169,16 @@ export default function Studio({ id }: { id: string }) {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      startAttempt.current += 1;
+      cancelControlAuthentication.current?.();
       settingsUpdater.cancel();
       streamRef.current?.getTracks().forEach((t) => {
         t.onended = null;
         t.stop();
       });
-      void roomRef.current?.disconnect();
+      controlRef.current?.close();
+      void publisherRef.current?.stop();
+      publisherRef.current = null;
     };
   }, []);
   useEffect(() => {
@@ -171,15 +187,19 @@ export default function Studio({ id }: { id: string }) {
   useEffect(() => {
     if (info?.state === "ended") {
       settingsUpdater.cancel();
+      startAttempt.current += 1;
+      cancelControlAuthentication.current?.();
       setEnded(true);
       setLive(false);
-      tracksRef.current = null;
       resetDiagnostics();
       streamRef.current?.getTracks().forEach((t) => {
         t.onended = null;
         t.stop();
       });
-      void roomRef.current?.disconnect();
+      controlRef.current?.close();
+      controlRef.current = null;
+      void publisherRef.current?.stop();
+      publisherRef.current = null;
     }
   }, [info?.state]);
   useEffect(() => {
@@ -198,96 +218,107 @@ export default function Studio({ id }: { id: string }) {
           `${audioCapture.sampleRate ? `${audioCapture.sampleRate / 1000} кГц` : "—"} · ${audioCapture.channelCount === 2 ? "стерео" : audioCapture.channelCount ? "моно" : "—"}`,
         );
 
-      const tracks = tracksRef.current;
-      if (!tracks) return;
-      const videoRead = statsSessionGuard.capture(tracks.video);
+      const sources = publisherRef.current?.getStatsSources();
+      if (!sources?.video) return;
+      const video = sources.video;
+      const videoRead = statsSessionGuard.capture(video);
       if (videoRead)
-        void tracks.video
-          .getRTCStatsReport()
-          .then((report) => {
-            if (!report || !mounted.current) {
+        void readPublisherMetrics(video, previousVideoSample.current)
+          .then((result) => {
+            if (!mounted.current) {
               statsSessionGuard.release(videoRead);
               return;
             }
-            if (!statsSessionGuard.commit(videoRead, tracksRef.current?.video))
+            if (
+              !statsSessionGuard.commit(
+                videoRead,
+                publisherRef.current?.getStatsSources().video,
+              )
+            )
               return;
-            const parsed = parseOutboundStats(
-              Array.from(report.values()),
-              previousVideoSample.current,
-            );
-            previousVideoSample.current = parsed.sample;
-            setVideoMetrics(parsed.metrics);
+            previousVideoSample.current = result.sample;
+            setVideoMetrics(result.metrics);
           })
           .catch(() => statsSessionGuard.release(videoRead));
-      if (tracks.audio) {
-        const audio = tracks.audio;
+      if (sources.audio) {
+        const audio = sources.audio;
         const audioRead = statsSessionGuard.capture(audio);
         if (audioRead)
-          void audio
-            .getRTCStatsReport()
-            .then((report) => {
-              if (!report || !mounted.current) {
+          void readPublisherMetrics(audio, previousAudioSample.current)
+            .then((result) => {
+              if (!mounted.current) {
                 statsSessionGuard.release(audioRead);
                 return;
               }
               if (
-                !statsSessionGuard.commit(audioRead, tracksRef.current?.audio)
+                !statsSessionGuard.commit(
+                  audioRead,
+                  publisherRef.current?.getStatsSources().audio,
+                )
               )
                 return;
-              const parsed = parseOutboundStats(
-                Array.from(report.values()),
-                previousAudioSample.current,
-              );
-              previousAudioSample.current = parsed.sample;
-              setAudioMetrics(parsed.metrics);
+              previousAudioSample.current = result.sample;
+              setAudioMetrics(result.metrics);
             })
             .catch(() => statsSessionGuard.release(audioRead));
       }
     }, 1000);
     return () => clearInterval(timer);
   }, [live]);
-  async function stopPublishing() {
+  async function stopPublishing(
+    stopGeneration: () => Promise<unknown> = async () => {},
+  ) {
     setLive(false);
+    startAttempt.current += 1;
+    cancelControlAuthentication.current?.();
+    cancelControlAuthentication.current = null;
     await settingsUpdater.settleAndCancel();
-    const room = roomRef.current;
-    const tracks = tracksRef.current;
+    const publisher = publisherRef.current;
+    publisherRef.current = null;
+    const control = controlRef.current;
+    controlRef.current = null;
     const stream = streamRef.current;
-    tracksRef.current = null;
     streamRef.current = null;
+    generationRef.current = null;
     resetDiagnostics();
+    setActiveConfig(null);
+    setPeerCounts({ connected: 0, failed: 0 });
     stream?.getTracks().forEach((t) => {
       t.onended = null;
     });
     try {
-      if (room && tracks) {
-        const unpublished: Promise<unknown>[] = [];
-        if (room.localParticipant.getTrackPublication(Track.Source.ScreenShare))
-          unpublished.push(
-            room.localParticipant.unpublishTrack(tracks.video, false),
-          );
-        if (
-          tracks.audio &&
-          room.localParticipant.getTrackPublication(
-            Track.Source.ScreenShareAudio,
-          )
-        )
-          unpublished.push(
-            room.localParticipant.unpublishTrack(tracks.audio, false),
-          );
-        await Promise.all(unpublished);
-      }
+      await stopStudioBroadcast({
+        stopPublisher: async () => {
+          control?.close();
+          try {
+            await publisher?.stop();
+          } finally {
+            stream?.getTracks().forEach((t) => t.stop());
+          }
+        },
+        stopGeneration: async () => {
+          await stopGeneration();
+        },
+      });
     } finally {
-      stream?.getTracks().forEach((t) => t.stop());
       if (preview.current) preview.current.srcObject = null;
+      setState("disconnected");
     }
   }
   async function pause() {
-    if (ending.current || stopping.current || !tracksRef.current) return;
+    if (ending.current || stopping.current || !publisherRef.current) return;
     stopping.current = true;
     setBusy(true);
     setError("");
+    const generation = generationRef.current;
     try {
-      await stopPublishing();
+      await stopPublishing(async () => {
+        if (generation !== null)
+          await api(`/rooms/${id}/stop`, {
+            hostSecret: secret,
+            generation,
+          });
+      });
     } catch (e) {
       setError(message(e));
     } finally {
@@ -300,8 +331,7 @@ export default function Studio({ id }: { id: string }) {
     ending.current = true;
     setBusy(true);
     await stopPublishing().catch(() => {});
-    await roomRef.current?.disconnect();
-    roomRef.current = null;
+    generationRef.current = null;
     try {
       await api(`/rooms/${id}/end`, { hostSecret: secret });
       setEnded(true);
@@ -313,15 +343,24 @@ export default function Studio({ id }: { id: string }) {
     }
   }
   async function start() {
+    if (busy || publisherRef.current || ending.current || stopping.current)
+      return;
+    const viewerLimit = normalizeViewerLimit(broadcastConfig.viewerLimit);
+    if (viewerLimit === null) {
+      setLimitError("Введите положительное целое число без пробелов.");
+      return;
+    }
+    setLimitError("");
     settingsUpdater.cancel();
     setError("");
     setNote("");
     setBusy(true);
-    tracksRef.current = null;
     resetDiagnostics();
-    let stream: MediaStream | null = null;
-    let room = roomRef.current;
-    let connectedHere = false;
+    setPeerCounts({ connected: 0, failed: 0 });
+    const attempt = ++startAttempt.current;
+    let createdPublisher: ActivePublisher | null = null;
+    let createdControl: ControlSocket | null = null;
+    let published = false;
     try {
       if (!secret)
         throw new Error(
@@ -331,53 +370,169 @@ export default function Studio({ id }: { id: string }) {
         throw new Error(
           "Захват экрана требует HTTPS или localhost и поддерживаемый настольный браузер.",
         );
-      // Capture first, while the click still provides user activation.
-      stream = await navigator.mediaDevices.getDisplayMedia(
-        displayCaptureOptions(),
-      );
-      if (!mounted.current) {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-      setNote(await applyQuality(stream.getVideoTracks()[0], settings));
+      const result = await startStudioBroadcast({
+        transport: broadcastConfig.transport,
+        viewerLimit,
+        settings,
+        // Capture stays first so the click retains browser user activation.
+        capture: () =>
+          navigator.mediaDevices.getDisplayMedia(displayCaptureOptions()),
+        prepareCapture: async (stream) => {
+          setNote(await applyQuality(stream.getVideoTracks()[0], settings));
+        },
+        startGeneration: (config) =>
+          api(`/rooms/${id}/start`, { hostSecret: secret, ...config }),
+        stopGeneration: (generation) =>
+          api(`/rooms/${id}/stop`, {
+            hostSecret: secret,
+            generation,
+          }),
+        isCurrent: () =>
+          mounted.current &&
+          startAttempt.current === attempt &&
+          !ending.current &&
+          !stopping.current,
+        createPublisher: (transport, response) => {
+          const generation = response.generation;
+          let statsVideo: RTCStatsProvider | undefined;
+          const callbacks = {
+            onConnectionState: (
+              current: number,
+              next: Parameters<typeof setState>[0],
+            ) => {
+              if (
+                mounted.current &&
+                publisherRef.current === createdPublisher &&
+                current === generation
+              )
+                setState(next);
+            },
+            onDisconnected: (current: number) => {
+              if (
+                !published ||
+                !mounted.current ||
+                publisherRef.current !== createdPublisher ||
+                current !== generation ||
+                ending.current ||
+                stopping.current
+              )
+                return;
+              void pause().then(() => {
+                if (mounted.current && !publisherRef.current)
+                  setError(
+                    "Соединение прервано. Повторите запуск; убедитесь, что студия не открыта в другой вкладке.",
+                  );
+              });
+            },
+            onPublishedTracksChanged: (
+              current: number,
+              sources: ReturnType<StudioPublisher["getStatsSources"]>,
+            ) => {
+              if (
+                publisherRef.current !== createdPublisher ||
+                current !== generation
+              )
+                return;
+              if (statsVideo && statsVideo !== sources.video) resetStats();
+              statsVideo = sources.video;
+            },
+            onPeerCountsChanged: (
+              current: number,
+              connected: number,
+              failed: number,
+            ) => {
+              if (
+                publisherRef.current === createdPublisher &&
+                current === generation
+              )
+                setPeerCounts({ connected, failed });
+            },
+          };
+          createdPublisher =
+            transport === "p2p"
+              ? createP2PPublisher(callbacks)
+              : createLiveKitPublisher(callbacks);
+          publisherRef.current = createdPublisher;
+          generationRef.current = generation;
+          return createdPublisher;
+        },
+        connectControl: ({ response, publisher, handleSignal }) => {
+          const generation = response.generation;
+          let authenticated = false;
+          let resolveAuthenticated!: () => void;
+          let rejectAuthenticated!: (error: unknown) => void;
+          const authenticatedPromise = new Promise<void>((resolve, reject) => {
+            resolveAuthenticated = resolve;
+            rejectAuthenticated = reject;
+          });
+          const control = createControlSocket({
+            roomId: id,
+            getTicket: async () =>
+              (
+                await api<{ ticket: string }>(`/rooms/${id}/signal-ticket`, {
+                  hostSecret: secret,
+                  generation,
+                })
+              ).ticket,
+            onSignal: (signal) => {
+              if (
+                publisherRef.current !== publisher ||
+                generationRef.current !== generation
+              )
+                return;
+              if (signal.type === "authenticated") {
+                authenticated = true;
+                cancelControlAuthentication.current = null;
+                resolveAuthenticated();
+                return;
+              }
+              if (signal.type === "room-ended") {
+                void stopPublishing();
+                return;
+              }
+              void handleSignal(signal).catch((failure: unknown) => {
+                if (publisherRef.current === publisher && mounted.current)
+                  setError(message(failure));
+              });
+            },
+            onFatal: (failure) => {
+              if (!authenticated) {
+                rejectAuthenticated(failure);
+                return;
+              }
+              if (publisherRef.current === publisher && mounted.current) {
+                void pause().then(() => {
+                  if (mounted.current && !publisherRef.current)
+                    setError(message(failure));
+                });
+              }
+            },
+          });
+          createdControl = control;
+          controlRef.current = control;
+          cancelControlAuthentication.current = () =>
+            rejectAuthenticated(new Error("Запуск трансляции отменён"));
+          control.connect(response.ticket);
+          return { control, authenticated: authenticatedPromise };
+        },
+      });
+      if (!result) return;
+      const { stream, response, config, publisher, control } = result;
+      if (!publisher || !control) return;
       streamRef.current = stream;
-      if (!room || room.state !== ConnectionState.Connected) {
-        const auth = await api<Connection>(`/rooms/${id}/host-token`, {
-          hostSecret: secret,
-        });
-        room = new Room({ adaptiveStream: false, dynacast: false });
-        roomRef.current = room;
-        room.on(RoomEvent.ConnectionStateChanged, setState);
-        room.on(RoomEvent.Disconnected, () => {
-          if (!ending.current && mounted.current && roomRef.current === room) {
-            settingsUpdater.cancel();
-            streamRef.current?.getTracks().forEach((t) => {
-              t.onended = null;
-              t.stop();
-            });
-            roomRef.current = null;
-            setLive(false);
-            tracksRef.current = null;
-            resetDiagnostics();
-            setError(
-              "Соединение прервано. Повторите запуск; убедитесь, что студия не открыта в другой вкладке.",
-            );
-          }
-        });
-        await room.connect(auth.url, auth.token);
-        connectedHere = true;
-      }
-      if (!mounted.current) {
-        if (connectedHere) await room.disconnect();
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-      tracksRef.current = await publishScreen(room, stream, settings);
+      publisherRef.current = publisher;
+      controlRef.current = control as ControlSocket;
+      generationRef.current = response.generation;
+      published = true;
+      setBroadcastConfig(config);
+      setActiveConfig(config);
+      saveBroadcastConfigSafely(() => window.localStorage, config);
       confirmedSettings.current = settings;
       setAppliedSettings(settings);
       setHasAudio(stream.getAudioTracks().length > 0);
       setSurface(stream.getVideoTracks()[0].getSettings().displaySurface || "");
       setMuted(false);
+      if (config.transport === "p2p") setState("connected");
       stream.getVideoTracks()[0].onended = () => {
         void pause();
       };
@@ -391,22 +546,20 @@ export default function Studio({ id }: { id: string }) {
       }
     } catch (e) {
       settingsUpdater.cancel();
-      tracksRef.current = null;
-      resetDiagnostics();
-      stream?.getTracks().forEach((t) => t.stop());
-      if (connectedHere) {
-        await room?.disconnect();
-        if (roomRef.current === room) roomRef.current = null;
-      }
-      setError(captureError(e));
+      cancelControlAuthentication.current = null;
+      if (publisherRef.current === createdPublisher)
+        publisherRef.current = null;
+      if (controlRef.current === createdControl) controlRef.current = null;
+      if (startAttempt.current === attempt) generationRef.current = null;
+      if (mounted.current && startAttempt.current === attempt)
+        setError(captureError(e));
     } finally {
-      setBusy(false);
+      if (mounted.current && startAttempt.current === attempt) setBusy(false);
     }
   }
   function commitSettings(next: StreamSettings) {
     setSettings(next);
-    const tracks = tracksRef.current;
-    if (stopping.current || !tracks || !live) {
+    if (stopping.current || !publisherRef.current || !live) {
       confirmedSettings.current = next;
       return;
     }
@@ -456,7 +609,7 @@ export default function Studio({ id }: { id: string }) {
             {isEnded
               ? "Эфир завершён"
               : live
-                ? "В прямом эфире"
+                ? `В прямом эфире · ${transportLabel(activeConfig?.transport ?? broadcastConfig.transport)}`
                 : "Готовы к эфиру"}
           </span>
         </div>
@@ -532,10 +685,18 @@ export default function Studio({ id }: { id: string }) {
                   <Wifi size={15} />
                   {roomStateLabel(state)}
                 </span>
-                <span>
+                <span
+                  className="viewer-count"
+                  title={`${info?.viewers || 0} / ${activeConfig?.viewerLimit ?? info?.viewerLimit ?? "10"} зрителей`}
+                >
                   <Users size={15} />
-                  {info?.viewers || 0} / 10 зрителей
+                  {info?.viewers || 0} /{" "}
+                  {activeConfig?.viewerLimit ?? info?.viewerLimit ?? "10"}{" "}
+                  зрителей
                 </span>
+                {live && activeConfig && (
+                  <span>{transportLabel(activeConfig.transport)}</span>
+                )}
               </div>
             </div>
             <ErrorBox
@@ -565,6 +726,94 @@ export default function Studio({ id }: { id: string }) {
                 <Settings2 size={18} />
                 <h2>Настройки эфира</h2>
               </div>
+              <fieldset className="transport-picker">
+                <legend>Способ подключения</legend>
+                <div className="transport-options">
+                  <label
+                    className={`transport-option ${broadcastConfig.transport === "p2p" ? "selected" : ""}`}
+                  >
+                    <input
+                      type="radio"
+                      name="transport"
+                      value="p2p"
+                      checked={broadcastConfig.transport === "p2p"}
+                      disabled={live || busy}
+                      onChange={() =>
+                        setBroadcastConfig((current) => ({
+                          ...current,
+                          transport: "p2p",
+                        }))
+                      }
+                    />
+                    <span>
+                      <strong>P2P — напрямую</strong>
+                      <small>Отдельная отправка каждому зрителю.</small>
+                    </span>
+                  </label>
+                  <label
+                    className={`transport-option ${broadcastConfig.transport === "server" ? "selected" : ""}`}
+                  >
+                    <input
+                      type="radio"
+                      name="transport"
+                      value="server"
+                      checked={broadcastConfig.transport === "server"}
+                      disabled={live || busy}
+                      onChange={() =>
+                        setBroadcastConfig((current) => ({
+                          ...current,
+                          transport: "server",
+                        }))
+                      }
+                    />
+                    <span>
+                      <strong>Через сервер</strong>
+                      <small>Один upload ведущего, раздача через SFU.</small>
+                    </span>
+                  </label>
+                </div>
+              </fieldset>
+              <p className="p2p-warning">
+                Поток отправляется отдельно каждому зрителю. Участники могут
+                видеть сетевые адреса друг друга. Если прямое соединение
+                заблокировано NAT или firewall, автоматического перехода через
+                сервер не будет.
+              </p>
+              <div className="viewer-limit-control">
+                <label htmlFor="viewer-limit">Лимит зрителей</label>
+                <input
+                  id="viewer-limit"
+                  className="viewer-limit-input"
+                  type="text"
+                  inputMode="numeric"
+                  aria-label="Лимит зрителей"
+                  aria-invalid={limitError ? "true" : undefined}
+                  aria-describedby={
+                    limitError ? "viewer-limit-error" : undefined
+                  }
+                  value={broadcastConfig.viewerLimit}
+                  disabled={live || busy}
+                  onChange={(event) => {
+                    const viewerLimit = event.currentTarget.value;
+                    setBroadcastConfig((current) => ({
+                      ...current,
+                      viewerLimit,
+                    }));
+                    if (limitError && normalizeViewerLimit(viewerLimit))
+                      setLimitError("");
+                  }}
+                />
+                {limitError && (
+                  <p
+                    id="viewer-limit-error"
+                    className="field-error"
+                    role="alert"
+                  >
+                    {limitError}
+                  </p>
+                )}
+              </div>
+              <div className="separator" />
               <div className="range-control">
                 <div className="range-heading">
                   <label htmlFor="resolution">Разрешение</label>
@@ -799,10 +1048,18 @@ export default function Studio({ id }: { id: string }) {
                   }
                   disabled={!live || !hasAudio}
                   onClick={() => {
-                    streamRef.current?.getAudioTracks().forEach((t) => {
-                      t.enabled = muted;
-                    });
-                    setMuted(!muted);
+                    const publisher = publisherRef.current;
+                    if (!publisher) return;
+                    const next = !muted;
+                    void publisher
+                      .setMuted(next)
+                      .then(() => {
+                        if (publisherRef.current === publisher) setMuted(next);
+                      })
+                      .catch((failure) => {
+                        if (publisherRef.current === publisher)
+                          setError(message(failure));
+                      });
                   }}
                 >
                   {muted || !hasAudio ? (
@@ -816,6 +1073,17 @@ export default function Studio({ id }: { id: string }) {
             {live && (
               <section className="panel diagnostics">
                 <h2>Диагностика отправки</h2>
+                {activeConfig?.transport === "p2p" && (
+                  <div className="metric-group peer-metrics">
+                    <h3>Прямые подключения</h3>
+                    <span className="metric-row">
+                      Подключено <strong>{peerCounts.connected}</strong>
+                    </span>
+                    <span className="metric-row">
+                      Не удалось <strong>{peerCounts.failed}</strong>
+                    </span>
+                  </div>
+                )}
                 <div className="metric-group">
                   <h3>Видео</h3>
                   <span className="metric-row">

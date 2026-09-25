@@ -26,6 +26,90 @@ export type ParsedStats = {
   sample?: CounterSample;
 };
 
+const additiveMetricKeys = [
+  "bitrateKbps",
+  "packets",
+  "packetsLost",
+  "retransmittedPackets",
+  "droppedFrames",
+] as const satisfies readonly (keyof StreamMetrics)[];
+
+const worstMetricKeys = [
+  "lossPercent",
+  "rttMs",
+  "jitterMs",
+  "bufferMs",
+] as const satisfies readonly (keyof StreamMetrics)[];
+
+const representativeMetricKeys = [
+  "width",
+  "height",
+  "fps",
+] as const satisfies readonly (keyof StreamMetrics)[];
+
+const limitationRank = (reason: string) => {
+  if (reason === "cpu") return 3;
+  if (reason === "bandwidth") return 2;
+  if (reason === "none") return 0;
+  return 1;
+};
+
+export function aggregateOutboundMetrics(
+  peerReports: readonly StreamMetrics[],
+): StreamMetrics {
+  const aggregate: StreamMetrics = {};
+
+  for (const key of additiveMetricKeys) {
+    const values = peerReports
+      .map((report) => report[key])
+      .filter(
+        (value): value is number =>
+          typeof value === "number" && Number.isFinite(value),
+      );
+    if (values.length > 0)
+      (aggregate as Record<string, unknown>)[key] = values.reduce(
+        (total, value) => total + value,
+        0,
+      );
+  }
+
+  for (const key of worstMetricKeys) {
+    const values = peerReports
+      .map((report) => report[key])
+      .filter(
+        (value): value is number =>
+          typeof value === "number" && Number.isFinite(value),
+      );
+    if (values.length > 0)
+      (aggregate as Record<string, unknown>)[key] = Math.max(...values);
+  }
+
+  for (const key of representativeMetricKeys) {
+    const value = peerReports.find(
+      (report) =>
+        typeof report[key] === "number" && Number.isFinite(report[key]),
+    )?.[key];
+    if (value !== undefined)
+      (aggregate as Record<string, unknown>)[key] = value;
+  }
+
+  aggregate.codec = peerReports.find((report) => report.codec)?.codec;
+  if (aggregate.codec === undefined) delete aggregate.codec;
+
+  let limitation: string | undefined;
+  for (const report of peerReports) {
+    if (
+      report.limitation !== undefined &&
+      (limitation === undefined ||
+        limitationRank(report.limitation) > limitationRank(limitation))
+    )
+      limitation = report.limitation;
+  }
+  if (limitation !== undefined) aggregate.limitation = limitation;
+
+  return aggregate;
+}
+
 type StatsRow = Record<string, unknown>;
 
 const numberValue = (row: StatsRow, key: string): number | undefined => {

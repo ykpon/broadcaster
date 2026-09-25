@@ -11,6 +11,7 @@ import {
   applyQuality,
   displayCaptureOptions,
   publishScreen,
+  unpublishScreen,
   updateQuality,
   type PublishedTracks,
 } from "./media";
@@ -164,6 +165,29 @@ describe("publishScreen", () => {
       dtx: false,
     });
   });
+});
+
+it("unpublishes both screen tracks without stopping the captured source", async () => {
+  const source = { stop: vi.fn() };
+  const audioSource = { stop: vi.fn() };
+  const video = { mediaStreamTrack: source } as unknown as LocalVideoTrack;
+  const audio = { mediaStreamTrack: audioSource } as unknown as LocalAudioTrack;
+  const unpublishTrack = vi.fn(async () => {});
+  const room = {
+    localParticipant: {
+      getTrackPublication: () => ({}),
+      unpublishTrack,
+    },
+  } as unknown as Room;
+  await unpublishScreen(room, {
+    video,
+    audio,
+    videoPublication: {} as LocalTrackPublication,
+  });
+  expect(unpublishTrack).toHaveBeenCalledWith(video, false);
+  expect(unpublishTrack).toHaveBeenCalledWith(audio, false);
+  expect(source.stop).not.toHaveBeenCalled();
+  expect(audioSource.stop).not.toHaveBeenCalled();
 });
 
 it("публикует AV1 4K120 с ручными video/audio bitrate", async () => {

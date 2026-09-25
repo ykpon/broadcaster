@@ -28,6 +28,12 @@ describe("viewer playout buffer", () => {
     expect(applyPlayoutBuffer(track, 2.4)).toBe("playoutDelayHint");
     expect(setPlayoutDelay).toHaveBeenCalledWith(2.4);
   });
+  it("sets native receiver playoutDelayHint for P2P tracks", () => {
+    const receiver = { playoutDelayHint: null };
+    const track = { receiver };
+    expect(applyPlayoutBuffer(track, 1.3)).toBe("playoutDelayHint");
+    expect(receiver.playoutDelayHint).toBe(1.3);
+  });
   it("does not interfere with viewing when no API is supported", () => {
     const track = {
       receiver: {},

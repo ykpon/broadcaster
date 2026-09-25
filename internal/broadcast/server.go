@@ -14,20 +14,30 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 type Room struct {
-	ID                         string               `json:"roomId"`
-	State                      string               `json:"state"`
-	Viewers                    int                  `json:"viewers"`
-	Secret                     [32]byte             `json:"-"`
-	Name                       string               `json:"-"`
-	Created, EmptySince, Ended time.Time            `json:"-"`
-	Deleted                    bool                 `json:"-"`
-	Seats                      map[string]time.Time `json:"-"`
+	ID                         string                    `json:"roomId"`
+	State                      string                    `json:"state"`
+	Viewers                    int                       `json:"viewers"`
+	Generation                 uint64                    `json:"generation"`
+	Transport                  Transport                 `json:"transport,omitempty"`
+	ViewerLimit                ViewerLimit               `json:"-"`
+	Secret                     [32]byte                  `json:"-"`
+	MediaRoom                  string                    `json:"-"`
+	Active                     bool                      `json:"-"`
+	Created, EmptySince, Ended time.Time                 `json:"-"`
+	Deleted                    bool                      `json:"-"`
+	Seats                      map[string]time.Time      `json:"-"`
+	Tickets                    map[[32]byte]ticketRecord `json:"-"`
+	Peers                      map[string]*signalPeer    `json:"-"`
+	HostGrace                  *hostGrace                `json:"-"`
+	PrepareOwner               string                    `json:"-"`
+	Controlled                 bool                      `json:"-"`
 }
 type bucket struct {
 	Start time.Time
@@ -37,13 +47,21 @@ type Server struct {
 	mu                          sync.Mutex
 	rooms                       map[string]*Room
 	limits                      map[string]bucket
+	controlPeers                map[*signalPeer]struct{}
+	controlWG                   sync.WaitGroup
+	shutdownOnce                sync.Once
+	shutdownDone                chan struct{}
+	shuttingDown                bool
 	media                       Media
 	PublicURL, MediaURL, WebDir string
+	STUNURL                     string
 	TrustProxy                  bool
+	now                         func() time.Time
+	afterFunc                   func(time.Duration, func()) signalTimer
 }
 
 func New(media Media, publicURL, mediaURL, webDir string) *Server {
-	return &Server{rooms: make(map[string]*Room), limits: make(map[string]bucket), media: media, PublicURL: strings.TrimRight(publicURL, "/"), MediaURL: mediaURL, WebDir: webDir}
+	return &Server{rooms: make(map[string]*Room), limits: make(map[string]bucket), controlPeers: make(map[*signalPeer]struct{}), shutdownDone: make(chan struct{}), media: media, PublicURL: strings.TrimRight(publicURL, "/"), MediaURL: mediaURL, WebDir: webDir, STUNURL: "stun:localhost:3478", now: time.Now, afterFunc: func(d time.Duration, f func()) signalTimer { return time.AfterFunc(d, f) }}
 }
 func randomID() string {
 	b := make([]byte, 24)
@@ -78,8 +96,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("POST /api/rooms", s.create)
 	mux.HandleFunc("GET /api/rooms/{id}", s.status)
-	mux.HandleFunc("POST /api/rooms/{id}/host-token", s.host)
-	mux.HandleFunc("POST /api/rooms/{id}/viewer-token", s.viewer)
+	mux.HandleFunc("POST /api/rooms/{id}/start", s.start)
+	mux.HandleFunc("POST /api/rooms/{id}/stop", s.stop)
+	mux.HandleFunc("POST /api/rooms/{id}/join", s.join)
+	mux.HandleFunc("POST /api/rooms/{id}/signal-ticket", s.signalTicket)
+	mux.HandleFunc("GET /api/rooms/{id}/signal", s.signal)
 	mux.HandleFunc("POST /api/rooms/{id}/end", s.end)
 	mux.HandleFunc("GET /api/", func(w http.ResponseWriter, r *http.Request) { problem(w, 404, "Маршрут не найден") })
 	mux.HandleFunc("GET /", s.static)
@@ -131,12 +152,8 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	id, secret := randomID(), randomID()
 	now := time.Now()
-	room := &Room{ID: id, State: "waiting", Secret: sha256.Sum256([]byte(secret)), Name: "broadcast-" + id, Created: now, EmptySince: now, Seats: make(map[string]time.Time)}
-	if err := s.media.Create(r.Context(), room.Name); err != nil {
-		log.Print(err)
-		problem(w, 503, "Медиасервер недоступен. Попробуйте ещё раз.")
-		return
-	}
+	limit, _ := ParseViewerLimit("10")
+	room := &Room{ID: id, State: "waiting", Secret: sha256.Sum256([]byte(secret)), ViewerLimit: limit, Created: now, EmptySince: now, Seats: make(map[string]time.Time), Tickets: make(map[[32]byte]ticketRecord), Peers: make(map[string]*signalPeer)}
 	s.rooms[id] = room
 	writeJSON(w, 201, map[string]string{"roomId": id, "viewerUrl": s.PublicURL + "/watch/" + id, "hostUrl": s.PublicURL + "/studio/" + id + "#key=" + secret})
 }
@@ -172,111 +189,232 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	room := s.lookup(w, r, false)
 	if room != nil {
-		writeJSON(w, 200, room)
+		writeJSON(w, 200, s.roomInfo(room))
 	}
 }
-func (s *Server) host(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	room := s.lookup(w, r, true)
-	if room == nil || !s.authorize(w, r, room) {
+
+func (s *Server) roomInfo(room *Room) RoomInfo {
+	return RoomInfo{RoomID: room.ID, State: room.State, Viewers: room.Viewers, Generation: room.Generation, Transport: room.Transport, ViewerLimit: room.ViewerLimit.String()}
+}
+
+type startInput struct {
+	HostSecret  string    `json:"hostSecret"`
+	Transport   Transport `json:"transport"`
+	ViewerLimit string    `json:"viewerLimit"`
+}
+
+func (s *Server) start(w http.ResponseWriter, r *http.Request) {
+	var input startInput
+	if decode(w, r, &input) != nil {
+		problem(w, 400, "Некорректный запрос")
 		return
 	}
-	// A fixed identity enforces one publisher per room on the SFU.
-	writeJSON(w, 200, map[string]string{"token": s.media.Token(room.Name, "host", true), "url": s.MediaURL})
+	limit, err := ParseViewerLimit(input.ViewerLimit)
+	if err != nil || (input.Transport != TransportP2P && input.Transport != TransportServer) {
+		problem(w, 400, "Некорректная конфигурация эфира")
+		return
+	}
+	response, code, message := s.startRoom(r.Context(), r.PathValue("id"), input.HostSecret, input.Transport, limit)
+	if code != 200 {
+		problem(w, code, message)
+		return
+	}
+	writeJSON(w, 200, response)
 }
-func (s *Server) viewer(w http.ResponseWriter, r *http.Request) {
+
+func (s *Server) startRoom(ctx context.Context, id, secret string, transport Transport, limit ViewerLimit) (StartResponse, int, string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	room := s.lookup(w, r, true)
+	room := s.rooms[id]
 	if room == nil {
-		return
+		s.mu.Unlock()
+		return StartResponse{}, 404, "Комната не найдена или срок её действия истёк"
 	}
+	if room.State == "ended" {
+		s.mu.Unlock()
+		return StartResponse{}, 410, "Эфир завершён"
+	}
+	if room.Active || room.PrepareOwner != "" {
+		s.mu.Unlock()
+		return StartResponse{}, 409, "Эфир уже запущен"
+	}
+	hash := sha256.Sum256([]byte(secret))
+	if subtle.ConstantTimeCompare(hash[:], room.Secret[:]) != 1 {
+		s.mu.Unlock()
+		return StartResponse{}, 403, "Нужна ссылка ведущего с ключом доступа"
+	}
+	occupied, generation := len(room.Seats), room.Generation
+	if !limit.Allows(occupied) {
+		s.mu.Unlock()
+		return StartResponse{}, 409, "Лимит зрителей меньше занятых мест"
+	}
+	nextGeneration := generation + 1
+	prepareOwner := randomID()
+	room.PrepareOwner = prepareOwner
+	mediaRoom := ""
+	if transport == TransportServer {
+		mediaRoom = "broadcast-" + id + "-" + strconv.FormatUint(nextGeneration, 10)
+	}
+	s.mu.Unlock()
+
+	if mediaRoom != "" {
+		if err := s.media.Create(ctx, mediaRoom); err != nil {
+			s.mu.Lock()
+			if room := s.rooms[id]; room != nil && room.PrepareOwner == prepareOwner {
+				room.PrepareOwner = ""
+			}
+			s.mu.Unlock()
+			log.Print(err)
+			return StartResponse{}, 503, "Медиасервер недоступен. Попробуйте ещё раз."
+		}
+	}
+
+	s.mu.Lock()
+	room = s.rooms[id]
+	if room == nil || room.State == "ended" || room.Active || room.PrepareOwner != prepareOwner || room.Generation != generation || len(room.Seats) != occupied || !limit.Allows(len(room.Seats)) {
+		if room != nil && room.PrepareOwner == prepareOwner {
+			room.PrepareOwner = ""
+		}
+		s.mu.Unlock()
+		if mediaRoom != "" {
+			if err := s.media.Delete(ctx, mediaRoom); err != nil {
+				log.Print(err)
+			}
+		}
+		return StartResponse{}, 409, "Конфигурация комнаты изменилась. Повторите запрос."
+	}
+	oldMediaRoom := room.MediaRoom
+	room.PrepareOwner = ""
+	room.Generation = nextGeneration
+	room.Transport = transport
+	room.ViewerLimit = limit
+	room.MediaRoom = mediaRoom
+	room.Active = true
+	room.State = "waiting"
+	room.Deleted = false
+	response := StartResponse{Generation: room.Generation, Transport: room.Transport}
+	response.Ticket = s.issueTicketLocked(room, signalAuth{Role: "host", Generation: room.Generation})
+	s.armHostGrace(room)
+	if transport == TransportP2P {
+		response.IceServers = []IceServer{{URLs: []string{s.STUNURL}}}
+	} else {
+		response.LiveKit = &LiveKitConnection{URL: s.MediaURL, Token: s.media.Token(room.MediaRoom, "host", true)}
+	}
+	s.notifyStarted(room)
+	s.mu.Unlock()
+
+	if oldMediaRoom != "" && oldMediaRoom != mediaRoom {
+		if err := s.media.Delete(ctx, oldMediaRoom); err != nil {
+			log.Print(err)
+		}
+	}
+	return response, 200, ""
+}
+
+func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Session string `json:"session"`
+		HostSecret string `json:"hostSecret"`
+		Generation uint64 `json:"generation"`
 	}
 	if decode(w, r, &input) != nil {
 		problem(w, 400, "Некорректный запрос")
 		return
 	}
-	if err := s.syncRoom(r.Context(), room, time.Now()); err != nil {
-		problem(w, 503, "Не удалось проверить свободные места")
+	s.mu.Lock()
+	room := s.lookup(w, r, true)
+	if room == nil {
+		s.mu.Unlock()
 		return
 	}
-	if room.State == "ended" {
-		problem(w, 410, "Эфир завершён")
+	hash := sha256.Sum256([]byte(input.HostSecret))
+	if subtle.ConstantTimeCompare(hash[:], room.Secret[:]) != 1 {
+		s.mu.Unlock()
+		problem(w, 403, "Нужна ссылка ведущего с ключом доступа")
 		return
 	}
-	// Session credentials are generated by this server, never chosen by a client.
-	identity := input.Session
-	if _, ok := room.Seats[identity]; !ok {
-		identity = ""
+	if input.Generation != room.Generation {
+		s.mu.Unlock()
+		problem(w, 409, "Запуск уже изменился")
+		return
 	}
-	if identity == "" {
-		if len(room.Seats) >= 10 {
-			problem(w, 409, "В комнате уже 10 зрителей. Попробуйте позже.")
-			return
-		}
-		identity = "viewer-" + randomID()
+	mediaRoom := s.stopGeneration(room)
+	s.mu.Unlock()
+	if err := s.deleteStoppedMedia(r.Context(), r.PathValue("id"), mediaRoom); err != nil {
+		log.Print(err)
+		problem(w, 503, "Не удалось остановить медиасервер")
+		return
 	}
-	room.Seats[identity] = time.Now().Add(90 * time.Second)
-	writeJSON(w, 200, map[string]string{"token": s.media.Token(room.Name, identity, false), "url": s.MediaURL, "session": identity})
+	writeJSON(w, 200, map[string]any{"state": "waiting", "generation": input.Generation})
 }
+
 func (s *Server) end(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	room := s.lookup(w, r, false)
 	if room == nil || !s.authorize(w, r, room) {
+		s.mu.Unlock()
 		return
 	}
 	s.markEnded(room, time.Now())
-	if err := s.media.Delete(r.Context(), room.Name); err != nil {
+	room.Active = false
+	mediaRoom := room.MediaRoom
+	if mediaRoom == "" {
+		room.Deleted = true
+		s.mu.Unlock()
+		writeJSON(w, 200, map[string]string{"state": "ended"})
+		return
+	}
+	s.mu.Unlock()
+	if err := s.media.Delete(r.Context(), mediaRoom); err != nil {
 		log.Print(err)
 		problem(w, 503, "Завершение запрошено. Сервер повторит отключение участников.")
 		return
 	}
-	room.Deleted = true
+	s.mu.Lock()
+	if room := s.rooms[r.PathValue("id")]; room != nil && room.MediaRoom == mediaRoom {
+		room.MediaRoom = ""
+		room.Deleted = true
+	}
+	s.mu.Unlock()
 	writeJSON(w, 200, map[string]string{"state": "ended"})
 }
 func (s *Server) markEnded(room *Room, now time.Time) {
 	if room.State != "ended" {
 		room.State = "ended"
 		room.Ended = now
+		room.Active = false
+		s.closeRoomPeers(room)
 	}
 }
 func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error {
 	if room.State == "ended" {
 		return nil
 	}
-	participants, err := s.media.Participants(ctx, room.Name)
+	if room.Transport != TransportServer || room.MediaRoom == "" || room.Controlled {
+		s.expireSeats(room, now)
+		if len(room.Peers) > 0 {
+			room.EmptySince = time.Time{}
+		} else {
+			if room.EmptySince.IsZero() {
+				room.EmptySince = now
+			}
+			if now.Sub(room.EmptySince) > time.Hour {
+				s.markEnded(room, now)
+			}
+		}
+		return nil
+	}
+	participants, err := s.media.Participants(ctx, room.MediaRoom)
 	if err != nil {
 		return err
 	}
 	room.Viewers = 0
-	host, video := false, false
 	for _, p := range participants {
 		if p.Identity == "host" {
-			host = true
-			for _, t := range p.Tracks {
-				if t.Source == "SCREEN_SHARE" {
-					video = true
-				}
-			}
-		} else {
-			room.Viewers++
-			room.Seats[p.Identity] = now.Add(90 * time.Second)
+			continue
 		}
+		room.Viewers++
+		room.Seats[p.Identity] = now.Add(90 * time.Second)
 	}
-	for id, expiry := range room.Seats {
-		if now.After(expiry) {
-			delete(room.Seats, id)
-		}
-	}
-	if host && video {
-		room.State = "live"
-	} else {
-		room.State = "waiting"
-	}
+	s.expireSeats(room, now)
 	if len(participants) > 0 {
 		room.EmptySince = time.Time{}
 	} else if room.EmptySince.IsZero() {
@@ -286,6 +424,14 @@ func (s *Server) syncRoom(ctx context.Context, room *Room, now time.Time) error 
 		s.markEnded(room, now)
 	}
 	return nil
+}
+
+func (s *Server) expireSeats(room *Room, now time.Time) {
+	for id, expiry := range room.Seats {
+		if room.Peers[id] == nil && !now.Before(expiry) {
+			delete(room.Seats, id)
+		}
+	}
 }
 func (s *Server) RunCleanup(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Second)
@@ -302,7 +448,10 @@ func (s *Server) RunCleanup(ctx context.Context) {
 				}
 				if room.State == "ended" {
 					if !room.Deleted {
-						if err := s.media.Delete(ctx, room.Name); err == nil {
+						if room.MediaRoom == "" {
+							room.Deleted = true
+						} else if err := s.media.Delete(ctx, room.MediaRoom); err == nil {
+							room.MediaRoom = ""
 							room.Deleted = true
 						} else {
 							log.Print(err)

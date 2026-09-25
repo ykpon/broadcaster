@@ -43,7 +43,10 @@ export function displayCaptureOptions(): RoutedDisplayMediaOptions {
   };
 }
 
-const videoSettingsChanged = (previous: StreamSettings, next: StreamSettings) =>
+export const videoSettingsChanged = (
+  previous: StreamSettings,
+  next: StreamSettings,
+) =>
   previous.resolution !== next.resolution ||
   previous.fps !== next.fps ||
   previous.videoBitrateMbps !== next.videoBitrateMbps ||
@@ -112,6 +115,31 @@ export async function applyQuality(
   }
 }
 
+export async function applyVideoSenderSettings(
+  sender: RTCRtpSender,
+  settings: StreamSettings,
+): Promise<void> {
+  const params = sender.getParameters();
+  for (const encoding of params.encodings ?? []) {
+    encoding.maxBitrate = settings.videoBitrateMbps * 1_000_000;
+    encoding.maxFramerate = settings.fps;
+  }
+  params.degradationPreference = qualityHints(
+    settings.balance,
+  ).degradationPreference;
+  await sender.setParameters(params);
+}
+
+export async function applyAudioSenderSettings(
+  sender: RTCRtpSender,
+  settings: StreamSettings,
+): Promise<void> {
+  const params = sender.getParameters();
+  for (const encoding of params.encodings ?? [])
+    encoding.maxBitrate = settings.audioBitrateKbps * 1_000;
+  await sender.setParameters(params);
+}
+
 export async function publishScreen(
   room: Room,
   stream: MediaStream,
@@ -144,6 +172,21 @@ export async function publishScreen(
   }
 }
 
+export async function unpublishScreen(
+  room: Room,
+  tracks: PublishedTracks,
+): Promise<void> {
+  const pending: Promise<unknown>[] = [];
+  if (room.localParticipant.getTrackPublication(Track.Source.ScreenShare))
+    pending.push(room.localParticipant.unpublishTrack(tracks.video, false));
+  if (
+    tracks.audio &&
+    room.localParticipant.getTrackPublication(Track.Source.ScreenShareAudio)
+  )
+    pending.push(room.localParticipant.unpublishTrack(tracks.audio, false));
+  await Promise.all(pending);
+}
+
 export async function updateQuality(
   room: Room,
   tracks: PublishedTracks,
@@ -152,12 +195,7 @@ export async function updateQuality(
 ): Promise<QualityUpdateResult> {
   if (tracks.audio && previous.audioBitrateKbps !== next.audioBitrateKbps) {
     const audioSender = tracks.audio.sender;
-    if (audioSender) {
-      const params = audioSender.getParameters();
-      for (const encoding of params.encodings ?? [])
-        encoding.maxBitrate = next.audioBitrateKbps * 1_000;
-      await audioSender.setParameters(params);
-    }
+    if (audioSender) await applyAudioSenderSettings(audioSender, next);
   }
 
   if (!videoSettingsChanged(previous, next)) {
@@ -183,15 +221,7 @@ export async function updateQuality(
   }
 
   const videoSender = tracks.video.sender;
-  if (videoSender) {
-    const params = videoSender.getParameters();
-    for (const encoding of params.encodings ?? []) {
-      encoding.maxBitrate = next.videoBitrateMbps * 1_000_000;
-      encoding.maxFramerate = next.fps;
-    }
-    params.degradationPreference = hints.degradationPreference;
-    await videoSender.setParameters(params);
-  }
+  if (videoSender) await applyVideoSenderSettings(videoSender, next);
   tracks.videoPublication.options = {
     ...tracks.videoPublication.options,
     ...videoPublishOptions(next),
